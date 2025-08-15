@@ -1,52 +1,122 @@
 'use client'
 
-import { useEffect, useMemo, useState, type FormEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import { useRouter, useParams } from 'next/navigation'
 import { supabase } from '../../lib/supabase'
 import Link from 'next/link'
 import {
   FiHome, FiCpu, FiTerminal, FiUsers, FiPlus, FiX, FiCalendar,
-  FiLock, FiGlobe, FiArrowLeft, FiEdit2, FiTrash2, FiCheck, FiUserPlus, FiCornerUpRight
+  FiLock, FiGlobe, FiArrowLeft, FiEdit2, FiTrash2, FiCheck, FiCornerUpRight,
+  FiZap, FiShield, FiBarChart2, FiArrowUp, FiDownload, FiCopy
 } from 'react-icons/fi'
-
-/** ---------- Sticky localStorage state (persists across refresh/navigation) ---------- */
-function useStickyState<T>(key: string, initial: T) {
-  const [state, setState] = useState<T>(() => {
-    if (typeof window === 'undefined') return initial
-    try {
-      const raw = window.localStorage.getItem(key)
-      return raw ? (JSON.parse(raw) as T) : initial
-    } catch { return initial }
-  })
-
-  useEffect(() => {
-    try { window.localStorage.setItem(key, JSON.stringify(state)) } catch {}
-  }, [key, state])
-
-  useEffect(() => {
-    try {
-      const raw = window.localStorage.getItem(key)
-      setState(raw ? (JSON.parse(raw) as T) : initial)
-    } catch {}
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key])
-
-  useEffect(() => {
-    const onStorage = (e: StorageEvent) => {
-      if (e.key === key && e.newValue) setState(JSON.parse(e.newValue))
-    }
-    window.addEventListener('storage', onStorage)
-    return () => window.removeEventListener('storage', onStorage)
-  }, [key])
-
-  return [state, setState] as const
-}
 
 /** ---------- Types ---------- */
 interface Colab { id: string; name: string; slug: string; description: string; readme: string; is_public: boolean; owner_id: string }
 interface Profile { id: string; username: string; full_name: string; avatar_url: string | null; bio?: string; role?: string }
 interface NoteRow { id: string; colab_id: string; user_id: string; content: string; created_at: string; parent_id: string | null }
 interface ResearchNote extends NoteRow { user: Profile }
+
+type PlanTier = 'free' | 'pro' | 'team'
+type UsageKind = 'ai_messages' | 'lit_searches' | 'analyses'
+
+/** ---------- Limits by plan (client view; enforce on server too) ---------- */
+const PLAN_LIMITS: Record<PlanTier, Record<UsageKind, number>> = {
+  free: { ai_messages: 150,  lit_searches: 50,   analyses: 10 },
+  pro:  { ai_messages: 2000, lit_searches: 500,  analyses: 200 },
+  team: { ai_messages: 10000, lit_searches: 2500, analyses: 1000 },
+}
+
+/** ---------- Helpers ---------- */
+const periodKey = () => {
+  const d = new Date()
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}`
+}
+
+/** ---------- Usage hook (Supabase-backed per user) ---------- */
+function useUsage(userId: string | null) {
+  const [tier, setTier] = useState<PlanTier>('free')
+  const [used, setUsed] = useState<Record<UsageKind, number>>({ ai_messages: 0, lit_searches: 0, analyses: 0 })
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const pKey = periodKey()
+
+  const limits = PLAN_LIMITS[tier]
+  const remaining = (k: UsageKind) => Math.max(0, (limits[k] ?? 0) - (used[k] ?? 0))
+  const exceeded  = (k: UsageKind) => remaining(k) <= 0
+
+  const refresh = async () => {
+    if (!userId) return
+    setLoading(true); setError(null)
+    try {
+      const { data: planRow, error: planErr } = await supabase
+        .from('user_plans')
+        .select('tier')
+        .eq('user_id', userId)
+        .maybeSingle()
+      if (planErr) throw planErr
+      setTier((planRow?.tier as PlanTier) || 'free')
+
+      const { data: usageRow, error: usageSelErr } = await supabase
+        .from('user_usage_monthly')
+        .select('ai_messages_used, lit_searches_used, analyses_used')
+        .eq('user_id', userId)
+        .eq('period', pKey)
+        .maybeSingle()
+
+      if (usageSelErr) throw usageSelErr
+      if (!usageRow) {
+        const { error: insErr } = await supabase
+          .from('user_usage_monthly')
+          .insert({ user_id: userId, period: pKey, ai_messages_used: 0, lit_searches_used: 0, analyses_used: 0 })
+        if (insErr) throw insErr
+        setUsed({ ai_messages: 0, lit_searches: 0, analyses: 0 })
+      } else {
+        setUsed({
+          ai_messages: usageRow.ai_messages_used ?? 0,
+          lit_searches: usageRow.lit_searches_used ?? 0,
+          analyses: usageRow.analyses_used ?? 0,
+        })
+      }
+    } catch (e:any) {
+      setError(e.message || 'Failed to load usage')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const increment = async (kind: UsageKind, amount = 1) => {
+    if (!userId) return
+    try {
+      const col =
+        kind === 'ai_messages' ? 'ai_messages_used' :
+        kind === 'lit_searches' ? 'lit_searches_used' : 'analyses_used'
+
+      // ensure row then atomic increment via RPC
+      try {
+        await supabase
+          .from('user_usage_monthly')
+          .insert({ user_id: userId, period: pKey })
+          .select('id')
+          .maybeSingle()
+      } catch {
+        // Row might already exist, ignore error
+      }
+
+      const { error: updErr } = await supabase
+        .rpc('increment_usage', { p_user_id: userId, p_period: pKey, p_column: col, p_amount: amount })
+      if (updErr) throw updErr
+
+      setUsed(prev => ({ ...prev, [kind]: (prev[kind] ?? 0) + amount }))
+    } catch {
+      // soft fallback — optimistic
+      setUsed(prev => ({ ...prev, [kind]: (prev[kind] ?? 0) + amount }))
+    }
+  }
+
+  useEffect(() => { refresh() }, [userId])
+
+  return { tier, limits, used, loading, error, remaining, exceeded, increment, periodLabel: 'this month' }
+}
 
 /** ---------- Page ---------- */
 export default function ColabPage() {
@@ -62,9 +132,7 @@ export default function ColabPage() {
 
   const router = useRouter()
   const { slug } = useParams() as { slug?: string }
-
-  const sectionKey = colab ? `colab:${colab.id}:section` : 'colab:pending:section'
-  const [currentSection, setCurrentSection] = useStickyState<'overview'|'peer-review'|'ai-copilot'|'compute-sandbox'>(sectionKey, 'overview')
+  const [currentSection, setCurrentSection] = useState<'overview'|'peer-review'|'ai-copilot'|'compute-sandbox'>('overview')
 
   const sessionUserId = sessionUser?.id || null
 
@@ -111,15 +179,8 @@ export default function ColabPage() {
     fetchData()
   }, [slug, router])
 
-  const joinColab = async () => {
-    if (!colab || !sessionUser) return
-    await supabase.from('colab_members').upsert({ colab_id: colab.id, user_id: sessionUser.id, role: 'member' })
-    setUserRole('member')
-  }
-
   const handleCreateNote = async (content: string, parentId: string | null = null) => {
     if (!colab || !sessionUser) return
-    if (!userRole && colab.is_public) await joinColab()
     const { data, error } = await supabase
       .from('research_notes')
       .insert({ colab_id: colab.id, user_id: sessionUser.id, content, parent_id: parentId })
@@ -130,7 +191,6 @@ export default function ColabPage() {
   }
 
   const startEdit = (id: string, value: string) => setEditing({ id, value })
-
   const saveEdit = async () => {
     if (!editing) return
     const { data } = await supabase
@@ -143,9 +203,8 @@ export default function ColabPage() {
     setEditing(null)
   }
 
-  // Delete a note and all its descendants from UI (and DB if possible)
+  // Delete a note and descendants
   const removeNote = async (id: string) => {
-    // collect descendants
     const childMap: Record<string, string[]> = {}
     for (const n of researchNotes) {
       if (n.parent_id) {
@@ -170,7 +229,7 @@ export default function ColabPage() {
     setResearchNotes(prev => prev.filter(n => !toDelete.has(n.id)))
   }
 
-  /** --- Build threaded tree (always compute; no conditional hooks) --- */
+  /** --- Build threaded tree --- */
   const childrenMap = useMemo(() => {
     const map: Record<string, ResearchNote[]> = {}
     for (const n of researchNotes) {
@@ -213,14 +272,6 @@ export default function ColabPage() {
     { id: 'compute-sandbox', label: 'Compute', icon: FiTerminal, count: null },
   ] as const
 
-  const Avatar = ({ u }: { u: Profile }) => (
-    <div className="w-10 h-10 rounded-full bg-gradient-to-br from-blue-500 to-purple-600 grid place-items-center overflow-hidden shrink-0">
-      {u?.avatar_url
-        ? <img src={u.avatar_url} alt="avatar" className="w-full h-full object-cover"/>
-        : <span className="text-white font-semibold">{u?.full_name?.[0] || 'U'}</span>}
-    </div>
-  )
-
   return (
     <div className="min-h-screen bg-slate-50 overflow-x-hidden">
       {/* Header */}
@@ -241,13 +292,8 @@ export default function ColabPage() {
               </div>
             </div>
           </div>
-          <div className="flex items-center gap-2">
-            {!userRole && colab.is_public && (
-              <button onClick={joinColab} className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border text-slate-700 hover:bg-slate-50">
-                <FiUserPlus/> Join
-              </button>
-            )}
-          </div>
+          {/* Join removed */}
+          <div className="w-10" />
         </div>
         <div className="border-t">
           <nav className="max-w-7xl mx-auto px-2 sm:px-6 overflow-x-auto no-scrollbar">
@@ -280,7 +326,7 @@ export default function ColabPage() {
           <section className="space-y-4">
             <div className="flex items-center justify-between">
               <h2 className="text-xl font-semibold">Peer Review</h2>
-              {canCreate && (
+              {(userRole === 'owner' || userRole === 'moderator' || userRole === 'member') && (
                 <button
                   onClick={()=>setShowNoteModal(true)}
                   className="hidden sm:inline-flex items-center gap-2 bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700">
@@ -309,18 +355,24 @@ export default function ColabPage() {
                 ))}
               </ul>
             ) : (
-              <Empty state="notes" onAdd={canCreate?()=>setShowNoteModal(true):undefined} />
+              <Empty state="notes" onAdd={(userRole === 'owner' || userRole === 'moderator' || userRole === 'member') ? ()=>setShowNoteModal(true):undefined} />
             )}
           </section>
         )}
 
-        {currentSection === 'ai-copilot' && <AICopilot readme={colab.readme} colabId={colab.id} />}
+        {currentSection === 'ai-copilot' && (
+          <AICopilot
+            readme={colab.readme}
+            colabId={colab.id}
+            userId={sessionUserId}
+          />
+        )}
 
         {currentSection === 'compute-sandbox' && <ComingSoon title="Compute Sandbox"/>}
       </main>
 
       {/* FAB mobile */}
-      {canCreate && currentSection==='peer-review' && (
+      {(userRole === 'owner' || userRole === 'moderator' || userRole === 'member') && currentSection==='peer-review' && (
         <div className="sm:hidden fixed bottom-5 right-5 z-50">
           <button
             onClick={()=>setShowNoteModal(true)}
@@ -409,7 +461,7 @@ function ThreadNode({
 
   const kids = childrenMap[node.id] || []
   const isMine = sessionUserId === node.user_id
-  const canEditDelete = isMine // AUTHOR ONLY
+  const canEditDelete = isMine
   const isEditing = editingId === node.id
 
   return (
@@ -512,7 +564,7 @@ function ThreadNode({
   )
 }
 
-/* ---------- Helper: nicely format AI text with spacing between points ---------- */
+/* ---------- Helper: nicely format AI text ---------- */
 function FormattedText({ text }: { text: string }) {
   const blocks = text.trim().split(/\n\s*\n+/)
   const isBullet = (line: string) => /^(?:\d+[\.)]|[-*•])\s+/.test(line.trim())
@@ -536,169 +588,207 @@ function FormattedText({ text }: { text: string }) {
   )
 }
 
-/* ---------- AI Co-Pilot with PubMed + Literature Agent (README-only) ---------- */
-function AICopilot({ readme, colabId }: { readme: string; colabId: string }) {
-  const [input, setInput] = useStickyState<string>(
-    `ai:${colabId}:draft`,
-    'Summarize the README and suggest next steps.'
-  )
-  const [messages, setMessages] = useStickyState<{ role: 'user'|'assistant'; content: string }[]>(
-    `ai:${colabId}:messages`,
-    []
-  )
+/* ---------- AI Co-Pilot (README-only) + Supabase Chat+Memory (per user) + Usage gating ---------- */
+function AICopilot({ readme, colabId, userId }: { readme: string; colabId: string; userId: string | null }) {
+  const [input, setInput] = useState('Summarize the README and suggest next steps.')
+  const [messages, setMessages] = useState<{ role: 'user'|'assistant'; content: string }[]>([])
+  const [litMemory, setLitMemory] = useState<string>('') // per user+colab
   const [loading, setLoading] = useState(false)
+  const { tier, limits, used, remaining, exceeded, increment, periodLabel } = useUsage(userId)
+  const [showUpgrade, setShowUpgrade] = useState(false)
 
-  // --- PubMed Quick Lookup ---
-  type QuickPaper = {
-    pmid: string
-    title: string
-    journal?: string
-    year?: string
-    authors?: string[]
-    doi?: string
-    url: string
-    abstract?: string
+  const [chatId, setChatId] = useState<string | null>(null)
+  const [persistReady, setPersistReady] = useState(false)
+  const [analysisReady, setAnalysisReady] = useState(false)
+
+  const chatRef = useRef<HTMLDivElement | null>(null)
+  const scrollToChat = () => chatRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+
+  // Load/create per-user chat + memory
+  useEffect(() => {
+    (async () => {
+      if (!userId || !colabId) return
+      try {
+        const { data: existing, error: selErr } = await supabase
+          .from('ai_chats')
+          .select('id')
+          .eq('colab_id', colabId)
+          .eq('user_id', userId)
+          .maybeSingle()
+        if (selErr) throw selErr
+        let cid = existing?.id
+        if (!cid) {
+          const { data: created, error: insErr } = await supabase
+            .from('ai_chats')
+            .insert({ colab_id: colabId, user_id: userId })
+            .select('id')
+            .single()
+          if (insErr) throw insErr
+          cid = created.id
+        }
+        setChatId(cid || null)
+
+        const { data: msgs } = await supabase
+          .from('ai_messages')
+          .select('role, content, created_at')
+          .eq('chat_id', cid)
+          .order('created_at', { ascending: true })
+          .limit(200)
+        if (Array.isArray(msgs)) {
+          setMessages(msgs.map(m => ({ role: m.role as 'user'|'assistant', content: m.content })))
+        }
+
+        const { data: mem } = await supabase
+          .from('ai_memories')
+          .select('content')
+          .eq('user_id', userId)
+          .eq('colab_id', colabId)
+          .eq('type', 'literature')
+          .maybeSingle()
+        if (mem?.content) setLitMemory(mem.content)
+
+        setPersistReady(true)
+      } catch {
+        setPersistReady(false)
+      }
+    })()
+  }, [userId, colabId])
+
+  async function appendMessage(role: 'user'|'assistant', content: string) {
+    setMessages(m => [...m, { role, content }])
+    if (persistReady && chatId) {
+      try { await supabase.from('ai_messages').insert({ chat_id: chatId, role, content }) } catch {}
+    }
   }
+  async function saveMemory(content: string) {
+    setLitMemory(content)
+    if (persistReady && userId) {
+      try {
+        await supabase.from('ai_memories').upsert(
+          { user_id: userId, colab_id: colabId, type: 'literature', content },
+          { onConflict: 'user_id,colab_id,type' }
+        )
+      } catch {}
+    }
+  }
+  async function clearChatOnly() {
+    setMessages([])
+    if (persistReady && chatId) {
+      try { await supabase.from('ai_messages').delete().eq('chat_id', chatId) } catch {}
+    }
+    setTimeout(() => chatRef.current?.scrollTo?.({ top: 0, behavior: 'smooth' }), 50)
+  }
+  async function clearChatAndMemory() {
+    setMessages([])
+    setLitMemory('')
+    if (persistReady && chatId && userId) {
+      try { await supabase.from('ai_messages').delete().eq('chat_id', chatId) } catch {}
+      try { await supabase.from('ai_memories').delete().eq('user_id', userId).eq('colab_id', colabId).eq('type', 'literature') } catch {}
+    }
+    setTimeout(() => chatRef.current?.scrollTo?.({ top: 0, behavior: 'smooth' }), 50)
+  }
+
+  // Always include README + memory in context
+ function makeAIPayload(userPrompt: string) {
+  const contextBits: string[] = []
+  if (readme?.trim()) contextBits.push(`README:\n${readme.trim()}`)
+  if (litMemory?.trim()) contextBits.push(`LATEST_LIT_ANALYSIS:\n${litMemory.trim()}`)
+  
+  return {
+    prompt: userPrompt,
+    colabId,
+    readme: contextBits.join('\n\n'), // Use 'readme' field instead of 'context'
+    history: messages.slice(-12),
+  }
+}
+
+  const send = async () => {
+    if (!input.trim()) return
+    if (exceeded('ai_messages')) { setShowUpgrade(true); return }
+    setLoading(true)
+    try {
+      await appendMessage('user', input)
+      const res = await fetch('/api/ai', {
+        method:'POST',
+        headers:{ 'Content-Type':'application/json' },
+        body: JSON.stringify(makeAIPayload(input))
+      })
+      const data = await res.json()
+      const bot = data?.text || 'No response'
+      await appendMessage('assistant', bot)
+      increment('ai_messages', 1)
+      setInput('')
+      setTimeout(scrollToChat, 150)
+    } finally { setLoading(false) }
+  }
+
+  // PubMed + Literature Agent
+  type QuickPaper = { pmid: string; title: string; journal?: string; year?: string; authors?: string[]; doi?: string; url: string; abstract?: string }
   const [q, setQ] = useState('cancer immunotherapy')
   const [pmid, setPmid] = useState('')
   const [fetching, setFetching] = useState(false)
   const [paper, setPaper] = useState<QuickPaper | null>(null)
   const [err, setErr] = useState<string | null>(null)
 
-  // Literature Agent
-  type LitItem = {
-    id: string
-    source: 'crossref'|'arxiv'|'s2'
-    title: string
-    year?: number
-    authors?: string[]
-    abstract?: string
-    doi?: string
-    url?: string
-    citationCount?: number
-    externalIds?: Record<string, string>
-  }
+  type LitItem = { id: string; source: 'crossref'|'arxiv'|'s2'; title: string; year?: number; authors?: string[]; abstract?: string; doi?: string; url?: string; citationCount?: number; externalIds?: Record<string, string> }
   const [litQ, setLitQ] = useState('large language models retrieval augmentation')
   const [litLoading, setLitLoading] = useState(false)
   const [litErr, setLitErr] = useState<string|null>(null)
-  const [litItems, setLitItems] = useState<LitItem[]>([])
   const [litTop, setLitTop] = useState<LitItem[]>([])
   const [analyzing, setAnalyzing] = useState(false)
-  const [analysisText, setAnalysisText] = useState<string>('')
-  const [analysisDone, setAnalysisDone] = useState(false)
-  useEffect(() => {
-    if (!analysisDone) return
-    const t = setTimeout(() => setAnalysisDone(false), 6000)
-    return () => clearTimeout(t)
-  }, [analysisDone])
 
-  const send = async () => {
-    if (!input.trim()) return
-    setLoading(true)
-    try {
-      const res = await fetch('/api/ai', {
-        method:'POST',
-        headers:{ 'Content-Type':'application/json' },
-        body: JSON.stringify({ prompt: input, colabId, readme }) // README only
-      })
-      const data = await res.json()
-      setMessages(m => [
-        ...m,
-        { role:'user', content: input },
-        { role:'assistant', content: data?.text || 'No response' }
-      ])
-      setInput('')
-    } finally { setLoading(false) }
-  }
-
-  const clearAll = () => { setMessages([]); setInput('') }
-
-  const fetchPubMed = async (mode: 'query'|'pmid') => {
-    setFetching(true); setErr(null)
-    try {
-      const body = mode === 'pmid' && pmid.trim()
-        ? { pmid: pmid.trim() }
-        : { query: q.trim() || 'cancer' }
-
-      const resp = await fetch('/api/pubmed', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-        body: JSON.stringify(body)
-      })
-
-      const ct = resp.headers.get('content-type') || ''
-      const raw = await resp.text()
-      if (!/application\/json/i.test(ct)) throw new Error('Non-JSON response')
-      const data = JSON.parse(raw)
-      if (!resp.ok) throw new Error(data?.error || 'Failed to fetch')
-      setPaper(data.paper || null)
-    } catch (e:any) {
-      setErr(e.message || 'Failed to fetch')
-      setPaper(null)
-    } finally {
-      setFetching(false)
-    }
-  }
-
-  function compactAuthors(a?: string[]) {
-    if (!a || !a.length) return ''
-    if (a.length <= 3) return a.join(', ')
-    return `${a.slice(0,3).join(', ')} et al.`
-  }
-
-  function mkCiteLine(x: LitItem, idx: number) {
-    const yr = x.year ? ` (${x.year})` : ''
-    const src = x.source.toUpperCase()
-    const doi = x.doi ? ` — doi:${x.doi}` : ''
-    const url = x.url ? ` ${x.url}` : ''
+  const compactAuthors = (a?: string[]) => !a?.length ? '' : (a.length <= 3 ? a.join(', ') : `${a.slice(0,3).join(', ')} et al.`)
+  const mkCiteLine = (x: LitItem, idx:number) => {
+    const yr = x.year ? ` (${x.year})` : ''; const src = x.source.toUpperCase(); const doi = x.doi ? ` — doi:${x.doi}` : ''; const url = x.url ? ` ${x.url}` : ''
     return `#${idx+1} ${x.title}${yr} — ${compactAuthors(x.authors)} [${src}]${doi}${url ? ` — ${url}` : ''}`
   }
-
   function mkGeminiContext(items: LitItem[], maxChars = 12000) {
     const blocks: string[] = []
-    for (let i = 0; i < items.length; i++) {
+    for (let i=0;i<items.length;i++){
       const x = items[i]
       const header = mkCiteLine(x, i)
       let abs = (x.abstract || '').trim()
       if (abs.length > 1500) abs = abs.slice(0, 1500) + '…'
-      const block = `${header}\nAbstract: ${abs || 'N/A'}`
-      blocks.push(block)
+      blocks.push(`${header}\nAbstract: ${abs || 'N/A'}`)
     }
     let out = ''
-    for (const b of blocks) {
-      if ((out + '\n\n' + b).length > maxChars) break
-      out += (out ? '\n\n' : '') + b
-    }
+    for (const b of blocks) { if ((out + '\n\n' + b).length > maxChars) break; out += (out ? '\n\n' : '') + b }
     return out
   }
 
+  const fetchPubMed = async (mode: 'query'|'pmid') => {
+    if (exceeded('lit_searches')) { setShowUpgrade(true); return }
+    setFetching(true); setErr(null)
+    try {
+      const body = mode === 'pmid' && pmid.trim() ? { pmid: pmid.trim() } : { query: q.trim() || 'cancer' }
+      const resp = await fetch('/api/pubmed', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Accept':'application/json' }, body: JSON.stringify(body) })
+      const ct = resp.headers.get('content-type') || ''; const raw = await resp.text()
+      if (!/application\/json/i.test(ct)) throw new Error('Non-JSON response')
+      const data = JSON.parse(raw); if (!resp.ok) throw new Error(data?.error || 'Failed to fetch')
+      setPaper(data.paper || null)
+      increment('lit_searches', 1)
+    } catch (e:any) { setErr(e.message || 'Failed to fetch'); setPaper(null) }
+    finally { setFetching(false) }
+  }
+
   async function runMultiSearch() {
+    if (exceeded('lit_searches')) { setShowUpgrade(true); return }
     setLitLoading(true); setLitErr(null)
     try {
-      const resp = await fetch('/api/lit/multisearch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-        body: JSON.stringify({ query: litQ, limit: 20 })
-      })
+      const resp = await fetch('/api/lit/multisearch', { method:'POST', headers:{'Content-Type':'application/json','Accept':'application/json'}, body: JSON.stringify({ query: litQ, limit: 20 }) })
       const text = await resp.text()
       if (!/application\/json/i.test(resp.headers.get('content-type')||'')) throw new Error('Non-JSON response')
-      const data = JSON.parse(text)
-      if (!resp.ok) throw new Error(data?.error || 'Failed search')
-      setLitItems(data.items || [])
+      const data = JSON.parse(text); if (!resp.ok) throw new Error(data?.error || 'Failed search')
       setLitTop(data.top || [])
-      setAnalysisText('')
-    } catch (e:any) {
-      setLitErr(e.message || 'Failed search')
-      setLitItems([]); setLitTop([])
-    } finally {
-      setLitLoading(false)
-    }
+      increment('lit_searches', 1)
+    } catch (e:any) { setLitErr(e.message || 'Failed search'); setLitTop([]) }
+    finally { setLitLoading(false) }
   }
 
   async function analyzeWithGemini() {
     if (!litTop.length) return
+    if (exceeded('analyses')) { setShowUpgrade(true); return }
     setAnalyzing(true)
-    setAnalysisText('')
     try {
       const literature_context = mkGeminiContext(litTop.slice(0, 10))
       const prompt = `
@@ -709,45 +799,115 @@ Here are top papers (Crossref, arXiv, Semantic Scholar). Papers are numbered and
 ${literature_context}
 
 Please provide:
-1) Key breakthrough findings (cite paper numbers, e.g., #2, #5)
+1) Key breakthrough findings (cite paper numbers)
 2) Areas of consensus vs. disagreement (cite)
-3) Gaps / limitations in current research (cite)
-4) Recommended next experiments or studies (cite)
-5) A shortlist of 5 must-read papers with rationale
+3) Gaps / limitations (cite)
+4) Recommended next experiments (cite)
+5) Shortlist of 5 must-read papers with rationale
 
-Respond concisely as a structured review with bullet points and numbered citations.
+Respond as bullet points with #numbers.
 `.trim()
 
-      const res = await fetch('/api/ai', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt, colabId, readme }) // README only
-      })
+      await appendMessage('user', `Analyze multi-source literature for: "${litQ}"`)
+      const res = await fetch('/api/ai', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(makeAIPayload(prompt)) })
       const data = await res.json()
       const text = data?.text || 'No response'
-      setMessages(m => [
-        ...m,
-        { role:'user', content: `Analyze multi-source literature for: "${litQ}"` },
-        { role:'assistant', content: text }
-      ])
-      setAnalysisText(text)
-      setAnalysisDone(true)
-    } catch (e:any) {
-      setAnalysisText(`Failed to analyze: ${e.message || 'Unknown error'}`)
-    } finally {
+      await appendMessage('assistant', text)
+      await saveMemory(text)
+      increment('analyses', 1)
+      setAnalysisReady(true)
       setAnalyzing(false)
+      setTimeout(scrollToChat, 250)
+    } catch (e:any) {
+      setAnalyzing(false); setAnalysisReady(false)
+      await appendMessage('assistant', `Failed to analyze: ${e?.message || 'Unknown error'}`)
+      setTimeout(scrollToChat, 150)
     }
+  }
+
+  // Extras
+  const exportChat = () => {
+    const blob = new Blob([JSON.stringify({ colabId, messages, litMemory, exportedAt: new Date().toISOString() }, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url; a.download = `chat-${colabId}.json`; a.click(); URL.revokeObjectURL(url)
+  }
+  const copyLastAI = async () => {
+    const last = [...messages].reverse().find(m => m.role === 'assistant')
+    if (last?.content) await navigator.clipboard.writeText(last.content)
+  }
+
+  const Meter = ({ label, used, total }: { label:string; used:number; total:number }) => {
+    const pct = Math.min(100, Math.round((used / Math.max(1,total)) * 100))
+    return (
+      <div className="space-y-1">
+        <div className="flex justify-between text-xs text-slate-600">
+          <span>{label}</span>
+          <span>{used}/{total}</span>
+        </div>
+        <div className="h-2 bg-slate-100 rounded-full overflow-hidden">
+          <div className="h-full bg-indigo-600" style={{ width: `${pct}%` }} />
+        </div>
+      </div>
+    )
   }
 
   return (
     <div className="bg-white border rounded-lg p-4 sm:p-6 space-y-6">
+      {/* Plan + usage header */}
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex items-center gap-2 text-sm text-slate-600">
+          <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full border bg-slate-50">
+            <FiShield className="w-3.5 h-3.5" /> {tier.toUpperCase()}
+          </span>
+          <span className="hidden sm:inline">Generous free tier · Fair usage applies ({periodLabel}).</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <button onClick={exportChat} className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border hover:bg-slate-50" title="Export chat">
+            <FiDownload /> Export
+          </button>
+          <button onClick={copyLastAI} className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border hover:bg-slate-50" title="Copy last AI answer">
+            <FiCopy /> Copy last AI
+          </button>
+          <Link href="/pricing" className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border hover:bg-slate-50">
+            <FiZap /> Upgrade
+          </Link>
+        </div>
+      </div>
+
+      {/* Usage meters */}
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        <Meter label="AI messages" used={used.ai_messages} total={limits.ai_messages} />
+        <Meter label="Literature searches" used={used.lit_searches} total={limits.lit_searches} />
+        <Meter label="Analyses" used={used.analyses} total={limits.analyses} />
+      </div>
+
+      {/* Chat header with Clear */}
       <div className="flex items-center justify-between">
-        <div className="text-sm text-slate-600">AI assistant with <strong>README-only</strong> context.</div>
-        <button onClick={clearAll} className="text-xs border px-2 py-1 rounded hover:bg-slate-50">Clear</button>
+        <div className="text-sm text-slate-600">
+          Chat with AI
+          {litMemory ? <span className="ml-2 text-xs px-2 py-0.5 rounded bg-slate-100 border">lit. analysis in memory</span> : null}
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={clearChatOnly}
+            className="text-xs border px-2 py-1 rounded hover:bg-slate-50"
+            title="Clear chat only"
+          >
+            Clear chat
+          </button>
+          <button
+            onClick={clearChatAndMemory}
+            className="text-xs border px-2 py-1 rounded hover:bg-slate-50"
+            title="Clear chat + forget memory"
+          >
+            Clear + forget
+          </button>
+        </div>
       </div>
 
       {/* Chat */}
-      <div className="space-y-3 max-h-[50vh] overflow-y-auto">
+      <div ref={chatRef} className="space-y-3 max-h-[50vh] overflow-y-auto scroll-smooth">
         {messages.map((m, i) => (
           <div key={i} className={`p-3 rounded-lg text-sm break-words ${m.role==='user'?'bg-slate-50':'bg-blue-50'}`}>
             {m.role === 'assistant' ? (
@@ -767,28 +927,28 @@ Respond concisely as a structured review with bullet points and numbered citatio
         <input
           value={input}
           onChange={e=>setInput(e.target.value)}
-          placeholder="Ask anything…"
-          className="flex-1 border rounded-lg px-3 py-2 min-w-0"
+          placeholder={exceeded('ai_messages') ? 'Limit reached — upgrade to continue' : 'Ask anything…'}
+          disabled={exceeded('ai_messages')}
+          className="flex-1 border rounded-lg px-3 py-2 min-w-0 disabled:opacity-60"
         />
-        <button onClick={send} disabled={loading || !input.trim()} className="px-4 py-2 rounded-lg bg-blue-600 text-white disabled:opacity-50">
+        <button
+          onClick={send}
+          disabled={loading || !input.trim() || exceeded('ai_messages')}
+          className="px-4 py-2 rounded-lg bg-blue-600 text-white disabled:opacity-50"
+        >
           {loading? 'Thinking…':'Send'}
         </button>
       </div>
-      <p className="text-xs text-slate-500">We pass only the README into the AI. Avoid sharing secrets in prompts.</p>
+      <p className="text-xs text-slate-500">We pass README + your latest literature analysis into the AI for context. Avoid sharing secrets.</p>
 
-      {/* Quick PubMed (NCBI) */}
+      {/* Quick PubMed */}
       <div className="border-t pt-5">
         <div className="flex items-center justify-between mb-3">
           <h3 className="font-semibold flex items-center gap-2">
             <span className="inline-flex items-center justify-center w-6 h-6 rounded bg-slate-900 text-white text-xs">NCBI</span>
             Quick PubMed Lookup
           </h3>
-          <button
-            onClick={() => { setQ(''); setPmid(''); setPaper(null); setErr(null) }}
-            className="text-xs border px-2 py-1 rounded hover:bg-slate-50"
-          >
-            Reset
-          </button>
+          <button onClick={() => { setQ(''); setPmid(''); setPaper(null); setErr(null) }} className="text-xs border px-2 py-1 rounded hover:bg-slate-50">Reset</button>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
@@ -796,12 +956,13 @@ Respond concisely as a structured review with bullet points and numbered citatio
             <input
               value={q}
               onChange={(e)=>setQ(e.target.value)}
-              placeholder="Search keywords (title/abstract)…"
-              className="flex-1 border rounded-lg px-3 py-2 min-w-0"
+              placeholder={exceeded('lit_searches') ? 'Limit reached — upgrade to continue' : 'Search keywords (title/abstract)…'}
+              disabled={exceeded('lit_searches')}
+              className="flex-1 border rounded-lg px-3 py-2 min-w-0 disabled:opacity-60"
             />
             <button
               onClick={()=>fetchPubMed('query')}
-              disabled={fetching || (!q.trim() && !pmid.trim())}
+              disabled={fetching || exceeded('lit_searches') || (!q.trim() && !pmid.trim())}
               className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-900 text-white disabled:opacity-50"
               title="Search by query"
             >
@@ -809,16 +970,11 @@ Respond concisely as a structured review with bullet points and numbered citatio
             </button>
           </div>
           <div className="flex items-center gap-2">
-            <input
-              value={pmid}
-              onChange={(e)=>setPmid(e.target.value)}
-              placeholder="PMID (optional)"
-              className="flex-1 border rounded-lg px-3 py-2 min-w-0"
-            />
+            <input value={pmid} onChange={(e)=>setPmid(e.target.value)} placeholder="PMID (optional)" className="flex-1 border rounded-lg px-3 py-2 min-w-0" />
             <button
               onClick={()=>fetchPubMed('pmid')}
-              disabled={fetching || !pmid.trim()}
-              className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border"
+              disabled={fetching || exceeded('lit_searches') || !pmid.trim()}
+              className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border disabled:opacity-50"
               title="Fetch by PMID"
             >
               Fetch
@@ -827,7 +983,6 @@ Respond concisely as a structured review with bullet points and numbered citatio
         </div>
 
         {err && <div className="mt-3 text-sm text-red-600 break-words">{err}</div>}
-
         {paper && (
           <article className="mt-4 bg-slate-50 border rounded-lg p-4">
             <div className="flex flex-wrap items-center gap-2 text-xs text-slate-600 mb-2">
@@ -837,18 +992,10 @@ Respond concisely as a structured review with bullet points and numbered citatio
               {paper.doi && <span className="px-2 py-0.5 rounded bg-white border break-words">DOI: {paper.doi}</span>}
             </div>
             <h4 className="font-semibold">{paper.title}</h4>
-            {paper.authors?.length ? (
-              <div className="text-sm text-slate-700 mt-1 break-words">{paper.authors.join(', ')}</div>
-            ) : null}
-            {paper.abstract ? (
-              <p className="text-sm text-slate-700 mt-3 whitespace-pre-wrap break-words">{paper.abstract}</p>
-            ) : (
-              <p className="text-sm text-slate-500 mt-3">No abstract available.</p>
-            )}
+            {paper.authors?.length ? <div className="text-sm text-slate-700 mt-1 break-words">{paper.authors.join(', ')}</div> : null}
+            {paper.abstract ? <p className="text-sm text-slate-700 mt-3 whitespace-pre-wrap break-words">{paper.abstract}</p> : <p className="text-sm text-slate-500 mt-3">No abstract available.</p>}
             <div className="mt-3">
-              <a href={paper.url} target="_blank" rel="noreferrer" className="text-sm text-blue-700 underline break-words">
-                View on PubMed
-              </a>
+              <a href={paper.url} target="_blank" rel="noreferrer" className="text-sm text-blue-700 underline break-words">View on PubMed</a>
             </div>
           </article>
         )}
@@ -857,13 +1004,10 @@ Respond concisely as a structured review with bullet points and numbered citatio
       {/* Literature Agent */}
       <div className="border-t pt-6">
         <div className="flex items-center justify-between mb-3">
-          <h3 className="font-semibold">Literature Agent (Crossref + arXiv + Semantic Scholar)</h3>
-          <button
-            onClick={() => { setLitQ(''); setLitItems([]); setLitTop([]); setLitErr(null); setAnalysisText('') }}
-            className="text-xs border px-2 py-1 rounded hover:bg-slate-50"
-          >
-            Reset
-          </button>
+          <h3 className="font-semibold flex items-center gap-2"><FiBarChart2 className="w-4 h-4" /> Literature Agent (Crossref + arXiv + S2)</h3>
+          <div className="flex items-center gap-2">
+            <button onClick={() => { setLitQ(''); setLitTop([]); setLitErr(null); setAnalysisReady(false) }} className="text-xs border px-2 py-1 rounded hover:bg-slate-50">Reset</button>
+          </div>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
@@ -871,12 +1015,13 @@ Respond concisely as a structured review with bullet points and numbered citatio
             <input
               value={litQ}
               onChange={e=>setLitQ(e.target.value)}
-              placeholder="e.g., graph neural networks drug discovery"
-              className="flex-1 border rounded-lg px-3 py-2 min-w-0"
+              placeholder={exceeded('lit_searches') ? 'Limit reached — upgrade to continue' : 'e.g., graph neural networks drug discovery'}
+              disabled={exceeded('lit_searches')}
+              className="flex-1 border rounded-lg px-3 py-2 min-w-0 disabled:opacity-60"
             />
             <button
               onClick={runMultiSearch}
-              disabled={litLoading || !litQ.trim()}
+              disabled={litLoading || !litQ.trim() || exceeded('lit_searches')}
               className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-900 text-white disabled:opacity-50"
               title="Search multiple sources"
             >
@@ -885,12 +1030,12 @@ Respond concisely as a structured review with bullet points and numbered citatio
           </div>
           <div className="flex items-center gap-2">
             <button
-              onClick={analyzeWithGemini}
-              disabled={!litTop.length || analyzing}
-              className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border disabled:opacity-50"
-              title="Send top results to AI"
+              onClick={analysisReady ? scrollToChat : analyzeWithGemini}
+              disabled={(!litTop.length && !analysisReady) || analyzing || exceeded('analyses')}
+              className={`inline-flex items-center gap-2 px-3 py-2 rounded-lg border disabled:opacity-50 ${analysisReady ? 'bg-blue-600 text-white border-blue-600' : ''}`}
+              title={analysisReady ? 'Jump to chat' : 'Send top results to AI'}
             >
-              {analyzing ? 'Analyzing…' : 'Analyze with AI'}
+              {analyzing ? 'Analyzing…' : (analysisReady ? <>View chat <FiArrowUp /></> : 'Analyze with AI')}
             </button>
           </div>
         </div>
@@ -907,55 +1052,49 @@ Respond concisely as a structured review with bullet points and numbered citatio
                     <span className="px-2 py-0.5 rounded bg-white border">#{i+1}</span>
                     {x.year && <span className="px-2 py-0.5 rounded bg-white border">{x.year}</span>}
                     <span className="px-2 py-0.5 rounded bg-white border">{x.source.toUpperCase()}</span>
-                    {typeof x.citationCount === 'number' && (
-                      <span className="px-2 py-0.5 rounded bg-white border">Citations: {x.citationCount}</span>
-                    )}
+                    {typeof x.citationCount === 'number' && <span className="px-2 py-0.5 rounded bg-white border">Citations: {x.citationCount}</span>}
                     {x.doi && <span className="px-2 py-0.5 rounded bg-white border break-words">doi:{x.doi}</span>}
                   </div>
                   <div className="font-medium break-words">{x.title}</div>
-                  {x.authors?.length ? (
-                    <div className="text-sm text-slate-700 mt-0.5 break-words">
-                      {x.authors.length <= 3 ? x.authors.join(', ') : `${x.authors.slice(0,3).join(', ')} et al.`}
-                    </div>
-                  ) : null}
-                  {x.abstract ? (
-                    <p className="text-sm text-slate-700 mt-2 line-clamp-3 break-words">{x.abstract}</p>
-                  ) : (
-                    <p className="text-sm text-slate-500 mt-2">No abstract available.</p>
-                  )}
-                  <div className="mt-2">
-                    {x.url ? (
-                      <a href={x.url} target="_blank" rel="noreferrer" className="text-sm text-blue-700 underline break-words">
-                        Open
-                      </a>
-                    ) : null}
-                  </div>
+                  {x.authors?.length ? <div className="text-sm text-slate-700 mt-0.5 break-words">{x.authors.length <= 3 ? x.authors.join(', ') : `${x.authors.slice(0,3).join(', ')} et al.`}</div> : null}
+                  {x.abstract ? <p className="text-sm text-slate-700 mt-2 line-clamp-3 break-words">{x.abstract}</p> : <p className="text-sm text-slate-500 mt-2">No abstract available.</p>}
+                  <div className="mt-2">{x.url ? <a href={x.url} target="_blank" rel="noreferrer" className="text-sm text-blue-700 underline break-words">Open</a> : null}</div>
                 </li>
               ))}
             </ul>
           </div>
         )}
 
-        {(analyzing || analysisText) && (
-          <div className="mt-6 bg-white border rounded-lg p-4">
-            {analysisDone && (
-              <div className="rounded-lg border border-green-200 bg-green-50 text-green-800 p-3 mb-3 flex items-center justify-between" role="status" aria-live="polite">
-                <div className="flex items-center gap-2">
-                  <FiCheck className="shrink-0" />
-                  <span>Literature review analysis completed — also posted in the chat above.</span>
-                </div>
-                <button onClick={()=>setAnalysisDone(false)} className="p-1 rounded hover:bg-green-100" aria-label="Dismiss" title="Dismiss">
-                  <FiX />
-                </button>
-              </div>
-            )}
-            <div className="text-sm text-slate-600 mb-2">
-              {analyzing ? 'Analyzing…' : 'Analysis ready.'}
+        {analysisReady && (
+          <div className="mt-6 rounded-lg border border-green-200 bg-green-50 text-green-800 p-3 flex items-center justify-between" role="status" aria-live="polite">
+            <div className="flex items-center gap-2">
+              <FiCheck className="shrink-0" />
+              <span>Literature review analysis posted to chat. Ask follow-ups and I'll remember.</span>
             </div>
-            {!analyzing && analysisText && <FormattedText text={analysisText} />}
+            <div className="flex items-center gap-2">
+              <button onClick={scrollToChat} className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-green-600 text-white hover:bg-green-700">
+                View chat <FiArrowUp />
+              </button>
+              <button onClick={()=>setAnalysisReady(false)} className="p-1 rounded hover:bg-green-100" aria-label="Dismiss" title="Dismiss">
+                <FiX />
+              </button>
+            </div>
           </div>
         )}
       </div>
+
+      {/* Upgrade modal */}
+      {showUpgrade && (
+        <UpgradeModal
+          tier={tier}
+          remaining={{
+            ai: remaining('ai_messages'),
+            search: remaining('lit_searches'),
+            analyses: remaining('analyses'),
+          }}
+          onClose={()=>setShowUpgrade(false)}
+        />
+      )}
     </div>
   )
 }
@@ -992,6 +1131,57 @@ function CreateModal({ title, placeholder, onClose, onSubmit }: { title:string; 
           <button type="submit" disabled={busy || !value.trim()} className="px-4 py-2 rounded-lg bg-indigo-600 text-white disabled:opacity-50">{busy? 'Posting…':'Post'}</button>
         </div>
       </form>
+    </div>
+  )
+}
+
+/* ---------- Upgrade Modal ---------- */
+function UpgradeModal({
+  tier, remaining, onClose
+}: {
+  tier: PlanTier,
+  remaining: { ai:number; search:number; analyses:number },
+  onClose: () => void
+}) {
+  return (
+    <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 backdrop-blur-sm p-4">
+      <div className="bg-white rounded-2xl max-w-lg w-full overflow-hidden shadow-xl">
+        <div className="px-5 py-4 border-b flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <FiZap className="text-yellow-500" />
+            <h3 className="font-semibold">Upgrade for higher limits</h3>
+          </div>
+          <button onClick={onClose} className="p-2 rounded hover:bg-slate-100">
+            <FiX />
+          </button>
+        </div>
+        <div className="p-5 space-y-4">
+          <p className="text-slate-700">
+            You're on the <strong>{tier.toUpperCase()}</strong> plan. You've reached a limit for one of the features.
+          </p>
+          <ul className="text-sm text-slate-700 space-y-2">
+            <li>• AI messages remaining: <strong>{remaining.ai}</strong></li>
+            <li>• Literature searches remaining: <strong>{remaining.search}</strong></li>
+            <li>• Analyses remaining: <strong>{remaining.analyses}</strong></li>
+          </ul>
+          <div className="bg-slate-50 border rounded-lg p-4">
+            <p className="text-sm font-medium mb-2">Why upgrade?</p>
+            <ul className="text-sm text-slate-700 space-y-1">
+              <li>✓ Bigger monthly limits + priority models</li>
+              <li>✓ Faster lanes during peak usage</li>
+              <li>✓ Team seats & collaboration controls</li>
+            </ul>
+          </div>
+          <div className="flex flex-col sm:flex-row gap-2">
+            <Link href="/pricing" className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700">
+              Explore plans
+            </Link>
+            <Link href="/billing" className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg border hover:bg-slate-50">
+              Manage billing
+            </Link>
+          </div>
+        </div>
+      </div>
     </div>
   )
 }
