@@ -1,12 +1,12 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import { useRouter, useParams } from 'next/navigation'
 import { supabase } from '../../lib/supabase'
 import Link from 'next/link'
 import {
-  FiHome, FiGitBranch, FiCpu, FiTerminal, FiUsers, FiDatabase, FiPlus, FiX, FiCalendar,
-  FiLock, FiGlobe, FiArrowLeft, FiEdit2, FiTrash2, FiCheck, FiUserPlus
+  FiHome, FiCpu, FiTerminal, FiUsers, FiPlus, FiX, FiCalendar,
+  FiLock, FiGlobe, FiArrowLeft, FiEdit2, FiTrash2, FiCheck, FiUserPlus, FiCornerUpRight
 } from 'react-icons/fi'
 
 /** ---------- Sticky localStorage state (persists across refresh/navigation) ---------- */
@@ -45,10 +45,7 @@ function useStickyState<T>(key: string, initial: T) {
 /** ---------- Types ---------- */
 interface Colab { id: string; name: string; slug: string; description: string; readme: string; is_public: boolean; owner_id: string }
 interface Profile { id: string; username: string; full_name: string; avatar_url: string | null; bio?: string; role?: string }
-interface ContributionRow { id: string; colab_id: string; user_id: string; description: string; created_at: string }
-interface NoteRow { id: string; colab_id: string; user_id: string; content: string; created_at: string }
-
-interface Contribution extends ContributionRow { user: Profile }
+interface NoteRow { id: string; colab_id: string; user_id: string; content: string; created_at: string; parent_id: string | null }
 interface ResearchNote extends NoteRow { user: Profile }
 
 /** ---------- Page ---------- */
@@ -57,29 +54,25 @@ export default function ColabPage() {
   const [creator, setCreator] = useState<Profile | null>(null)
   const [sessionUser, setSessionUser] = useState<{ id: string } | null>(null)
   const [userRole, setUserRole] = useState<string | null>(null)
-  const [contributions, setContributions] = useState<Contribution[]>([])
   const [researchNotes, setResearchNotes] = useState<ResearchNote[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [showContributionModal, setShowContributionModal] = useState(false)
   const [showNoteModal, setShowNoteModal] = useState(false)
-  const [editing, setEditing] = useState<{ type: 'contribution'|'note'; id: string; value: string } | null>(null)
+  const [editing, setEditing] = useState<{ id: string; value: string } | null>(null)
 
   const router = useRouter()
   const { slug } = useParams() as { slug?: string }
 
   const sectionKey = colab ? `colab:${colab.id}:section` : 'colab:pending:section'
-  const [currentSection, setCurrentSection] = useStickyState<
-    'overview'|'contributions'|'ai-copilot'|'compute-sandbox'|'peer-review'|'data-vault'
-  >(sectionKey, 'overview')
+  const [currentSection, setCurrentSection] = useStickyState<'overview'|'peer-review'|'ai-copilot'|'compute-sandbox'>(sectionKey, 'overview')
+
+  const sessionUserId = sessionUser?.id || null
 
   const canCreate = useMemo(() => {
     if (!colab || !sessionUser) return false
     if (userRole === 'owner' || userRole === 'moderator' || userRole === 'member') return true
     return !!colab.is_public
   }, [colab, sessionUser, userRole])
-
-  const canModerate = userRole === 'owner' || userRole === 'moderator'
 
   useEffect(() => {
     const fetchData = async () => {
@@ -105,18 +98,11 @@ export default function ColabPage() {
           .from('colab_members').select('role').eq('colab_id', colabData.id).eq('user_id', user.id).maybeSingle()
         if (!memberError) setUserRole(memberData?.role || null)
 
-        const { data: contributionsData } = await supabase
-          .from('contributions')
-          .select('*, user:profiles(id, username, full_name, avatar_url)')
-          .eq('colab_id', colabData.id)
-          .order('created_at', { ascending: false })
-        setContributions((contributionsData || []) as Contribution[])
-
         const { data: notesData } = await supabase
           .from('research_notes')
           .select('*, user:profiles(id, username, full_name, avatar_url)')
           .eq('colab_id', colabData.id)
-          .order('created_at', { ascending: false })
+          .order('created_at', { ascending: true })
         setResearchNotes((notesData || []) as ResearchNote[])
       } catch (err: any) {
         setError(err.message || 'Failed to load colab')
@@ -131,93 +117,118 @@ export default function ColabPage() {
     setUserRole('member')
   }
 
-  const handleCreateContribution = async (description: string) => {
-    if (!colab || !sessionUser) return
-    if (!userRole && colab.is_public) await joinColab()
-    const { data, error } = await supabase
-      .from('contributions')
-      .insert({ colab_id: colab.id, user_id: sessionUser.id, description })
-      .select('*, user:profiles(id, username, full_name, avatar_url)')
-      .single()
-    if (!error && data) setContributions(prev => [data as Contribution, ...prev])
-    setShowContributionModal(false)
-  }
-
-  const handleCreateNote = async (content: string) => {
+  const handleCreateNote = async (content: string, parentId: string | null = null) => {
     if (!colab || !sessionUser) return
     if (!userRole && colab.is_public) await joinColab()
     const { data, error } = await supabase
       .from('research_notes')
-      .insert({ colab_id: colab.id, user_id: sessionUser.id, content })
+      .insert({ colab_id: colab.id, user_id: sessionUser.id, content, parent_id: parentId })
       .select('*, user:profiles(id, username, full_name, avatar_url)')
       .single()
-    if (!error && data) setResearchNotes(prev => [data as ResearchNote, ...prev])
+    if (!error && data) setResearchNotes(prev => [...prev, data as ResearchNote])
     setShowNoteModal(false)
   }
 
-  const startEdit = (type: 'contribution'|'note', id: string, value: string) => setEditing({ type, id, value })
+  const startEdit = (id: string, value: string) => setEditing({ id, value })
 
   const saveEdit = async () => {
     if (!editing) return
-    if (editing.type === 'contribution') {
-      const { data } = await supabase.from('contributions').update({ description: editing.value }).eq('id', editing.id)
-        .select('*, user:profiles(id, username, full_name, avatar_url)').single()
-      if (data) setContributions(prev => prev.map(c => c.id === editing.id ? (data as Contribution) : c))
-    } else {
-      const { data } = await supabase.from('research_notes').update({ content: editing.value }).eq('id', editing.id)
-        .select('*, user:profiles(id, username, full_name, avatar_url)').single()
-      if (data) setResearchNotes(prev => prev.map(n => n.id === editing.id ? (data as ResearchNote) : n))
-    }
+    const { data } = await supabase
+      .from('research_notes')
+      .update({ content: editing.value })
+      .eq('id', editing.id)
+      .select('*, user:profiles(id, username, full_name, avatar_url)')
+      .single()
+    if (data) setResearchNotes(prev => prev.map(n => n.id === editing.id ? (data as ResearchNote) : n))
     setEditing(null)
   }
 
-  const removeItem = async (type: 'contribution'|'note', id: string) => {
-    if (type === 'contribution') {
-      await supabase.from('contributions').delete().eq('id', id)
-      setContributions(prev => prev.filter(c => c.id !== id))
-    } else {
-      await supabase.from('research_notes').delete().eq('id', id)
-      setResearchNotes(prev => prev.filter(n => n.id !== id))
+  // Delete a note and all its descendants from UI (and DB if possible)
+  const removeNote = async (id: string) => {
+    // collect descendants
+    const childMap: Record<string, string[]> = {}
+    for (const n of researchNotes) {
+      if (n.parent_id) {
+        if (!childMap[n.parent_id]) childMap[n.parent_id] = []
+        childMap[n.parent_id].push(n.id)
+      }
     }
+    const toDelete = new Set<string>([id])
+    const queue = [id]
+    while (queue.length) {
+      const cur = queue.shift()!
+      const kids = childMap[cur] || []
+      for (const k of kids) {
+        if (!toDelete.has(k)) { toDelete.add(k); queue.push(k) }
+      }
+    }
+    try {
+      await supabase.from('research_notes').delete().in('id', Array.from(toDelete))
+    } catch {
+      await supabase.from('research_notes').delete().eq('id', id)
+    }
+    setResearchNotes(prev => prev.filter(n => !toDelete.has(n.id)))
   }
 
-  if (loading) return (
-    <div className="min-h-screen bg-slate-50 grid place-items-center p-6">
-      <div className="animate-pulse text-slate-600">Loading collaboration…</div>
-    </div>
-  )
-  if (error || !colab) return (
-    <div className="min-h-screen bg-slate-50 grid place-items-center p-6">
-      <div className="bg-white border rounded-xl p-6 max-w-md w-full text-center">
-        <p className="text-sm text-red-600 mb-3">{error || 'Colab not found'}</p>
-        <Link href="/dashboard" className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 text-white"> <FiArrowLeft/> Back to Dashboard</Link>
+  /** --- Build threaded tree (always compute; no conditional hooks) --- */
+  const childrenMap = useMemo(() => {
+    const map: Record<string, ResearchNote[]> = {}
+    for (const n of researchNotes) {
+      const pid = n.parent_id || '__root__'
+      if (!map[pid]) map[pid] = []
+      map[pid].push(n)
+    }
+    Object.values(map).forEach(list =>
+      list.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
+    )
+    return map
+  }, [researchNotes])
+  const rootNotes = childrenMap['__root__'] || []
+
+  /** ---------- Render ---------- */
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-slate-50 grid place-items-center p-6">
+        <div className="animate-pulse text-slate-600">Loading collaboration…</div>
       </div>
-    </div>
-  )
+    )
+  }
+  if (error || !colab) {
+    return (
+      <div className="min-h-screen bg-slate-50 grid place-items-center p-6">
+        <div className="bg-white border rounded-xl p-6 max-w-md w-full text-center">
+          <p className="text-sm text-red-600 mb-3">{error || 'Colab not found'}</p>
+          <Link href="/dashboard" className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 text-white">
+            <FiArrowLeft/> Back to Dashboard
+          </Link>
+        </div>
+      </div>
+    )
+  }
 
   const sections = [
     { id: 'overview', label: 'Overview', icon: FiHome, count: null },
-    { id: 'contributions', label: 'Contributions', icon: FiGitBranch, count: contributions.length },
+    { id: 'peer-review', label: 'Peer Review', icon: FiUsers, count: researchNotes.length },
     { id: 'ai-copilot', label: 'AI Co-Pilot', icon: FiCpu, count: null },
     { id: 'compute-sandbox', label: 'Compute', icon: FiTerminal, count: null },
-    { id: 'peer-review', label: 'Peer Review', icon: FiUsers, count: researchNotes.length },
-    { id: 'data-vault', label: 'Data Vault', icon: FiDatabase, count: null },
   ] as const
 
   const Avatar = ({ u }: { u: Profile }) => (
-    <div className="w-10 h-10 rounded-full bg-gradient-to-br from-blue-500 to-purple-600 grid place-items-center overflow-hidden">
-      {u?.avatar_url ? <img src={u.avatar_url} alt="avatar" className="w-full h-full object-cover"/> : <span className="text-white font-semibold">{u?.full_name?.[0] || 'U'}</span>}
+    <div className="w-10 h-10 rounded-full bg-gradient-to-br from-blue-500 to-purple-600 grid place-items-center overflow-hidden shrink-0">
+      {u?.avatar_url
+        ? <img src={u.avatar_url} alt="avatar" className="w-full h-full object-cover"/>
+        : <span className="text-white font-semibold">{u?.full_name?.[0] || 'U'}</span>}
     </div>
   )
 
-  const isAuthor = (userId?: string) => userId && sessionUser?.id === userId
-
   return (
-    <div className="min-h-screen bg-slate-50">
+    <div className="min-h-screen bg-slate-50 overflow-x-hidden">
       {/* Header */}
       <header className="bg-white/95 backdrop-blur sticky top-0 z-40 border-b">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 py-3 flex items-center justify-between gap-3">
-          <Link href="/dashboard" className="flex items-center gap-2 text-slate-600 hover:text-slate-900"><FiArrowLeft/> <span className="hidden sm:inline">Dashboard</span></Link>
+          <Link href="/dashboard" className="flex items-center gap-2 text-slate-600 hover:text-slate-900">
+            <FiArrowLeft/> <span className="hidden sm:inline">Dashboard</span>
+          </Link>
           <div className="flex items-center gap-3 min-w-0">
             <div className="w-9 h-9 sm:w-10 sm:h-10 bg-gradient-to-br from-blue-500 to-purple-600 rounded-xl grid place-items-center shrink-0">
               <span className="text-white font-bold text-sm sm:text-base">{colab.name[0]}</span>
@@ -232,7 +243,9 @@ export default function ColabPage() {
           </div>
           <div className="flex items-center gap-2">
             {!userRole && colab.is_public && (
-              <button onClick={joinColab} className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border text-slate-700 hover:bg-slate-50"><FiUserPlus/> Join</button>
+              <button onClick={joinColab} className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border text-slate-700 hover:bg-slate-50">
+                <FiUserPlus/> Join
+              </button>
             )}
           </div>
         </div>
@@ -240,11 +253,16 @@ export default function ColabPage() {
           <nav className="max-w-7xl mx-auto px-2 sm:px-6 overflow-x-auto no-scrollbar">
             <div className="flex gap-1">
               {sections.map(s => (
-                <button key={s.id}
-                  onClick={() => setCurrentSection(s.id)}
+                <button
+                  key={s.id}
+                  onClick={() => setCurrentSection(s.id as any)}
                   className={`flex items-center gap-2 px-3 sm:px-4 py-3 text-sm border-b-2 whitespace-nowrap ${currentSection===s.id?'border-blue-600 text-blue-700':'border-transparent text-slate-600 hover:text-slate-900'}`}>
                   <s.icon className="w-4 h-4"/> {s.label}
-                  {s.count ? <span className={`text-xs px-2 py-0.5 rounded-full ${currentSection===s.id?'bg-blue-100 text-blue-800':'bg-slate-100 text-slate-600'}`}>{s.count}</span> : null}
+                  {s.count ? (
+                    <span className={`text-xs px-2 py-0.5 rounded-full ${currentSection===s.id?'bg-blue-100 text-blue-800':'bg-slate-100 text-slate-600'}`}>
+                      {s.count}
+                    </span>
+                  ) : null}
                 </button>
               ))}
             </div>
@@ -258,128 +276,67 @@ export default function ColabPage() {
           <Overview colab={colab} creator={creator} role={userRole} />
         )}
 
-        {currentSection === 'contributions' && (
-          <section className="space-y-4">
-            <div className="flex items-center justify-between">
-              <div>
-                <h2 className="text-xl font-semibold">Contributions</h2>
-                <p className="text-slate-600 text-sm">Progress and milestones</p>
-              </div>
-              {canCreate && (
-                <button onClick={()=>setShowContributionModal(true)} className="hidden sm:inline-flex items-center gap-2 bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700"><FiPlus/> Add</button>
-              )}
-            </div>
-
-            {contributions.length? contributions.map((c,i)=> (
-              <article key={c.id} className="bg-white border rounded-lg p-4 sm:p-6">
-                <div className="flex items-start gap-3">
-                  <Avatar u={c.user}/>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex flex-wrap items-center gap-2 text-sm text-slate-500 mb-1">
-                      <span className="font-medium text-slate-900">{c.user.full_name || 'Anonymous'}</span>
-                      <span>@{c.user.username}</span>
-                      <span>·</span>
-                      <span className="flex items-center gap-1"><FiCalendar className="w-3 h-3"/>{new Date(c.created_at).toLocaleDateString()}</span>
-                      <span className="ml-auto text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded-full">#{i+1}</span>
-                    </div>
-                    {editing?.type==='contribution' && editing.id===c.id ? (
-                      <div className="space-y-2">
-                        <textarea value={editing.value} onChange={e=>setEditing({ ...editing, value: e.target.value })} className="w-full border rounded-lg p-3 focus:ring-2 focus:ring-green-500"/>
-                        <div className="flex gap-2">
-                          <button onClick={saveEdit} className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-green-600 text-white"><FiCheck/> Save</button>
-                          <button onClick={()=>setEditing(null)} className="px-3 py-2 rounded-lg border">Cancel</button>
-                        </div>
-                      </div>
-                    ) : (
-                      <p className="text-slate-700 whitespace-pre-wrap">{c.description}</p>
-                    )}
-                  </div>
-                  {(isAuthor(c.user.id) || canModerate) && !editing && (
-                    <div className="flex gap-1">
-                      <button onClick={()=>startEdit('contribution', c.id, c.description)} className="p-2 rounded-lg hover:bg-slate-100" title="Edit"><FiEdit2/></button>
-                      <button onClick={()=>removeItem('contribution', c.id)} className="p-2 rounded-lg hover:bg-slate-100" title="Delete"><FiTrash2/></button>
-                    </div>
-                  )}
-                </div>
-              </article>
-            )) : (
-              <Empty state="contrib" onAdd={canCreate?()=>setShowContributionModal(true):undefined} />
-            )}
-          </section>
-        )}
-
         {currentSection === 'peer-review' && (
           <section className="space-y-4">
             <div className="flex items-center justify-between">
-              <div>
-                <h2 className="text-xl font-semibold">Peer Review</h2>
-                <p className="text-slate-600 text-sm">Notes and feedback</p>
-              </div>
+              <h2 className="text-xl font-semibold">Peer Review</h2>
               {canCreate && (
-                <button onClick={()=>setShowNoteModal(true)} className="hidden sm:inline-flex items-center gap-2 bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700"><FiPlus/> Add</button>
+                <button
+                  onClick={()=>setShowNoteModal(true)}
+                  className="hidden sm:inline-flex items-center gap-2 bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700">
+                  <FiPlus/> New thread
+                </button>
               )}
             </div>
 
-            {researchNotes.length? researchNotes.map((n,i)=> (
-              <article key={n.id} className="bg-white border rounded-lg p-4 sm:p-6">
-                <div className="flex items-start gap-3">
-                  <Avatar u={n.user}/>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex flex-wrap items-center gap-2 text-sm text-slate-500 mb-1">
-                      <span className="font-medium text-slate-900">{n.user.full_name || 'Anonymous'}</span>
-                      <span>@{n.user.username}</span>
-                      <span>·</span>
-                      <span className="flex items-center gap-1"><FiCalendar className="w-3 h-3"/>{new Date(n.created_at).toLocaleDateString()}</span>
-                      <span className="ml-auto text-xs bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full">Note #{i+1}</span>
-                    </div>
-                    {editing?.type==='note' && editing.id===n.id ? (
-                      <div className="space-y-2">
-                        <textarea value={editing.value} onChange={e=>setEditing({ ...editing, value: e.target.value })} className="w-full border rounded-lg p-3 focus:ring-2 focus:ring-indigo-500"/>
-                        <div className="flex gap-2">
-                          <button onClick={saveEdit} className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-indigo-600 text-white"><FiCheck/> Save</button>
-                          <button onClick={()=>setEditing(null)} className="px-3 py-2 rounded-lg border">Cancel</button>
-                        </div>
-                      </div>
-                    ) : (
-                      <p className="text-slate-700 whitespace-pre-wrap">{n.content}</p>
-                    )}
-                  </div>
-                  {(isAuthor(n.user.id) || canModerate) && !editing && (
-                    <div className="flex gap-1">
-                      <button onClick={()=>startEdit('note', n.id, n.content)} className="p-2 rounded-lg hover:bg-slate-100" title="Edit"><FiEdit2/></button>
-                      <button onClick={()=>removeItem('note', n.id)} className="p-2 rounded-lg hover:bg-slate-100" title="Delete"><FiTrash2/></button>
-                    </div>
-                  )}
-                </div>
-              </article>
-            )) : (
+            {rootNotes.length ? (
+              <ul className="space-y-3">
+                {rootNotes.map((n) => (
+                  <ThreadNode
+                    key={n.id}
+                    node={n}
+                    childrenMap={childrenMap}
+                    depth={0}
+                    sessionUserId={sessionUserId}
+                    onReply={(parentId, text)=>handleCreateNote(text, parentId)}
+                    onRequestEdit={startEdit}
+                    onRequestDelete={removeNote}
+                    editingId={editing?.id || null}
+                    editingValue={editing?.value || ''}
+                    onEditingChange={(v)=>setEditing(p=>p?{...p, value:v}:p)}
+                    onSaveEdit={saveEdit}
+                  />
+                ))}
+              </ul>
+            ) : (
               <Empty state="notes" onAdd={canCreate?()=>setShowNoteModal(true):undefined} />
             )}
           </section>
         )}
 
         {currentSection === 'ai-copilot' && <AICopilot readme={colab.readme} colabId={colab.id} />}
+
         {currentSection === 'compute-sandbox' && <ComingSoon title="Compute Sandbox"/>}
-        {currentSection === 'data-vault' && <ComingSoon title="Data Vault"/>}
       </main>
 
-      {/* Floating actions on mobile */}
-      {canCreate && (
+      {/* FAB mobile */}
+      {canCreate && currentSection==='peer-review' && (
         <div className="sm:hidden fixed bottom-5 right-5 z-50">
-          {currentSection==='contributions' && (
-            <button onClick={()=>setShowContributionModal(true)} className="w-14 h-14 rounded-full bg-green-600 text-white shadow-lg grid place-items-center"><FiPlus className="w-6 h-6"/></button>
-          )}
-          {currentSection==='peer-review' && (
-            <button onClick={()=>setShowNoteModal(true)} className="w-14 h-14 rounded-full bg-indigo-600 text-white shadow-lg grid place-items-center"><FiPlus className="w-6 h-6"/></button>
-          )}
+          <button
+            onClick={()=>setShowNoteModal(true)}
+            className="w-14 h-14 rounded-full bg-indigo-600 text-white shadow-lg grid place-items-center">
+            <FiPlus className="w-6 h-6"/>
+          </button>
         </div>
       )}
 
-      {showContributionModal && (
-        <CreateModal title="Add Contribution" placeholder="Describe your contribution…" onClose={()=>setShowContributionModal(false)} onSubmit={handleCreateContribution}/>
-      )}
       {showNoteModal && (
-        <CreateModal title="Add Research Note" placeholder="Add your research note…" onClose={()=>setShowNoteModal(false)} onSubmit={handleCreateNote}/>
+        <CreateModal
+          title="Start a new thread"
+          placeholder="Write your review or question…"
+          onClose={()=>setShowNoteModal(false)}
+          onSubmit={(v)=>handleCreateNote(v, null)}
+        />
       )}
     </div>
   )
@@ -392,10 +349,12 @@ function Overview({ colab, creator, role }: { colab: Colab; creator: Profile | n
     <div className="space-y-6">
       <div className="bg-white border rounded-lg p-6">
         <div className="flex items-center gap-2 mb-3">
-          <span className={`inline-flex items-center gap-2 px-3 py-1 rounded-full text-sm border ${colab.is_public? 'bg-green-50 text-green-700 border-green-200' : 'bg-slate-50 text-slate-700 border-slate-200'}`}>{colab.is_public? <><FiGlobe/> Public</> : <><FiLock/> Private</>} </span>
+          <span className={`inline-flex items-center gap-2 px-3 py-1 rounded-full text-sm border ${colab.is_public? 'bg-green-50 text-green-700 border-green-200' : 'bg-slate-50 text-slate-700 border-slate-200'}`}>
+            {colab.is_public? <><FiGlobe/> Public</> : <><FiLock/> Private</>}
+          </span>
           {role && <span className="inline-flex items-center px-3 py-1 rounded-full text-sm bg-blue-50 text-blue-700 border border-blue-200">{role}</span>}
         </div>
-        <p className="text-slate-700 whitespace-pre-wrap">{colab.description || 'A collaborative research project.'}</p>
+        <p className="text-slate-700 whitespace-pre-wrap break-words">{colab.description || 'A collaborative research project.'}</p>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
@@ -403,18 +362,20 @@ function Overview({ colab, creator, role }: { colab: Colab; creator: Profile | n
           <h3 className="font-semibold mb-4">Project Creator</h3>
           <div className="flex items-center gap-3">
             <div className="w-12 h-12 rounded-full overflow-hidden bg-gradient-to-br from-blue-500 to-purple-600 grid place-items-center">
-              {creator?.avatar_url ? <img src={creator.avatar_url} alt="creator"/> : <span className="text-white font-bold">{creator?.full_name?.[0] || 'U'}</span>}
+              {creator?.avatar_url ? <img src={creator.avatar_url} alt="creator" className="w-full h-full object-cover"/> : <span className="text-white font-bold">{creator?.full_name?.[0] || 'U'}</span>}
             </div>
-            <div>
-              <div className="font-semibold">{creator?.full_name || 'Unknown'}</div>
-              <div className="text-sm text-slate-600">@{creator?.username || 'unknown'}</div>
+            <div className="min-w-0">
+              <div className="font-semibold truncate">{creator?.full_name || 'Unknown'}</div>
+              <div className="text-sm text-slate-600 truncate">@{creator?.username || 'unknown'}</div>
             </div>
           </div>
         </div>
         <div className="lg:col-span-3 bg-white border rounded-lg p-6">
           <h3 className="font-semibold mb-3">README</h3>
           {colab.readme ? (
-            <div className="prose prose-slate max-w-none"><div className="whitespace-pre-wrap">{colab.readme}</div></div>
+            <div className="prose prose-slate max-w-none">
+              <div className="whitespace-pre-wrap break-words">{colab.readme}</div>
+            </div>
           ) : (
             <div className="text-slate-500">No README yet.</div>
           )}
@@ -424,10 +385,162 @@ function Overview({ colab, creator, role }: { colab: Colab; creator: Profile | n
   )
 }
 
+/* ---------- Threaded Review UI ---------- */
+function ThreadNode({
+  node, childrenMap, depth,
+  sessionUserId,
+  onReply, onRequestEdit, onRequestDelete,
+  editingId, editingValue, onEditingChange, onSaveEdit
+}: {
+  node: ResearchNote
+  childrenMap: Record<string, ResearchNote[]>
+  depth: number
+  sessionUserId: string | null
+  onReply: (parentId: string, text: string) => Promise<void>
+  onRequestEdit: (id: string, currentValue: string) => void
+  onRequestDelete: (id: string) => void
+  editingId: string | null
+  editingValue: string
+  onEditingChange: (v: string) => void
+  onSaveEdit: () => Promise<void>
+}) {
+  const [replying, setReplying] = useState(false)
+  const [reply, setReply] = useState('')
+
+  const kids = childrenMap[node.id] || []
+  const isMine = sessionUserId === node.user_id
+  const canEditDelete = isMine // AUTHOR ONLY
+  const isEditing = editingId === node.id
+
+  return (
+    <li className="bg-white border rounded-lg p-4">
+      <div className="flex items-start gap-3">
+        <div className="w-10 h-10 rounded-full bg-gradient-to-br from-blue-500 to-purple-600 grid place-items-center overflow-hidden shrink-0">
+          {node.user?.avatar_url
+            ? <img src={node.user.avatar_url} alt="avatar" className="w-full h-full object-cover"/>
+            : <span className="text-white font-semibold">{node.user?.full_name?.[0] || 'U'}</span>}
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="flex flex-wrap items-center gap-2 text-sm text-slate-500 mb-1">
+            <span className="font-medium text-slate-900 truncate">{node.user?.full_name || 'Anonymous'}</span>
+            <span className="truncate">@{node.user?.username}</span>
+            <span>·</span>
+            <span className="flex items-center gap-1"><FiCalendar className="w-3 h-3"/>{new Date(node.created_at).toLocaleDateString()}</span>
+          </div>
+
+          {isEditing ? (
+            <div className="space-y-2">
+              <textarea
+                value={editingValue}
+                onChange={e=>onEditingChange(e.target.value)}
+                className="w-full border rounded-lg p-3 focus:ring-2 focus:ring-indigo-500 whitespace-pre-wrap break-words"
+              />
+              <div className="flex flex-wrap gap-2">
+                <button onClick={onSaveEdit} className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-indigo-600 text-white">
+                  <FiCheck/> Save
+                </button>
+                <button onClick={()=>onEditingChange(node.content)} className="px-3 py-2 rounded-lg border">Reset</button>
+              </div>
+            </div>
+          ) : (
+            <p className="text-slate-700 whitespace-pre-wrap break-words">{node.content}</p>
+          )}
+
+          <div className="mt-3 flex flex-wrap items-center gap-3 text-sm">
+            <button onClick={()=>setReplying(v=>!v)} className="inline-flex items-center gap-2 px-2 py-1 rounded hover:bg-slate-50">
+              <FiCornerUpRight/> Reply
+            </button>
+            {canEditDelete && !isEditing && (
+              <>
+                <button
+                  onClick={()=>onRequestEdit(node.id, node.content)}
+                  className="inline-flex items-center gap-2 px-2 py-1 rounded hover:bg-slate-50">
+                  <FiEdit2/> Edit
+                </button>
+                <button
+                  onClick={()=>onRequestDelete(node.id)}
+                  className="inline-flex items-center gap-2 px-2 py-1 rounded hover:bg-slate-50 text-red-600">
+                  <FiTrash2/> Delete
+                </button>
+              </>
+            )}
+          </div>
+
+          {replying && (
+            <div className="mt-3">
+              <textarea
+                value={reply}
+                onChange={e=>setReply(e.target.value)}
+                placeholder="Write a reply…"
+                className="w-full border rounded-lg p-3 focus:ring-2 focus:ring-indigo-500 whitespace-pre-wrap break-words"
+              />
+              <div className="mt-2 flex flex-wrap gap-2">
+                <button
+                  onClick={async()=>{ if(!reply.trim()) return; await onReply(node.id, reply.trim()); setReply(''); setReplying(false) }}
+                  className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-indigo-600 text-white"
+                >
+                  <FiPlus/> Post reply
+                </button>
+                <button onClick={()=>setReplying(false)} className="px-3 py-2 rounded-lg border">Cancel</button>
+              </div>
+            </div>
+          )}
+
+          {kids.length > 0 && (
+            <ul className="mt-4 space-y-3 border-l pl-4">
+              {kids.map(child => (
+                <ThreadNode
+                  key={child.id}
+                  node={child}
+                  childrenMap={childrenMap}
+                  depth={depth+1}
+                  sessionUserId={sessionUserId}
+                  onReply={onReply}
+                  onRequestEdit={onRequestEdit}
+                  onRequestDelete={onRequestDelete}
+                  editingId={editingId}
+                  editingValue={editingValue}
+                  onEditingChange={onEditingChange}
+                  onSaveEdit={onSaveEdit}
+                />
+              ))}
+            </ul>
+          )}
+        </div>
+      </div>
+    </li>
+  )
+}
+
+/* ---------- Helper: nicely format AI text with spacing between points ---------- */
+function FormattedText({ text }: { text: string }) {
+  const blocks = text.trim().split(/\n\s*\n+/)
+  const isBullet = (line: string) => /^(?:\d+[\.)]|[-*•])\s+/.test(line.trim())
+  return (
+    <div className="prose prose-sm max-w-none break-words">
+      {blocks.map((block, idx) => {
+        const lines = block.split(/\n/)
+        const bulletLines = lines.every(l => l.trim() === '' || isBullet(l))
+        if (bulletLines) {
+          return (
+            <ul key={idx} className="space-y-2">
+              {lines.filter(l => l.trim()).map((l, i) => (
+                <li key={i}>{l.replace(/^(\d+[\.)]|[-*•])\s+/, '')}</li>
+              ))}
+            </ul>
+          )
+        }
+        return <p key={idx} className="mb-4 whitespace-pre-wrap break-words">{block}</p>
+      })}
+    </div>
+  )
+}
+
+/* ---------- AI Co-Pilot with PubMed + Literature Agent (README-only) ---------- */
 function AICopilot({ readme, colabId }: { readme: string; colabId: string }) {
   const [input, setInput] = useStickyState<string>(
     `ai:${colabId}:draft`,
-    'Summarize the current goals and suggest next steps.'
+    'Summarize the README and suggest next steps.'
   )
   const [messages, setMessages] = useStickyState<{ role: 'user'|'assistant'; content: string }[]>(
     `ai:${colabId}:messages`,
@@ -452,23 +565,55 @@ function AICopilot({ readme, colabId }: { readme: string; colabId: string }) {
   const [paper, setPaper] = useState<QuickPaper | null>(null)
   const [err, setErr] = useState<string | null>(null)
 
+  // Literature Agent
+  type LitItem = {
+    id: string
+    source: 'crossref'|'arxiv'|'s2'
+    title: string
+    year?: number
+    authors?: string[]
+    abstract?: string
+    doi?: string
+    url?: string
+    citationCount?: number
+    externalIds?: Record<string, string>
+  }
+  const [litQ, setLitQ] = useState('large language models retrieval augmentation')
+  const [litLoading, setLitLoading] = useState(false)
+  const [litErr, setLitErr] = useState<string|null>(null)
+  const [litItems, setLitItems] = useState<LitItem[]>([])
+  const [litTop, setLitTop] = useState<LitItem[]>([])
+  const [analyzing, setAnalyzing] = useState(false)
+  const [analysisText, setAnalysisText] = useState<string>('')
+  const [analysisDone, setAnalysisDone] = useState(false)
+  useEffect(() => {
+    if (!analysisDone) return
+    const t = setTimeout(() => setAnalysisDone(false), 6000)
+    return () => clearTimeout(t)
+  }, [analysisDone])
+
   const send = async () => {
     if (!input.trim()) return
     setLoading(true)
     try {
       const res = await fetch('/api/ai', {
-        method:'POST', headers:{ 'Content-Type':'application/json' },
-        body: JSON.stringify({ prompt: input, colabId, readme })
+        method:'POST',
+        headers:{ 'Content-Type':'application/json' },
+        body: JSON.stringify({ prompt: input, colabId, readme }) // README only
       })
       const data = await res.json()
-      setMessages(m => [...m, { role:'user', content: input }, { role:'assistant', content: data.text || 'No response' }])
+      setMessages(m => [
+        ...m,
+        { role:'user', content: input },
+        { role:'assistant', content: data?.text || 'No response' }
+      ])
       setInput('')
     } finally { setLoading(false) }
   }
 
   const clearAll = () => { setMessages([]); setInput('') }
 
-  const fetchPubMed = async (mode: 'query' | 'pmid') => {
+  const fetchPubMed = async (mode: 'query'|'pmid') => {
     setFetching(true); setErr(null)
     try {
       const body = mode === 'pmid' && pmid.trim()
@@ -483,65 +628,15 @@ function AICopilot({ readme, colabId }: { readme: string; colabId: string }) {
 
       const ct = resp.headers.get('content-type') || ''
       const raw = await resp.text()
-      if (!/application\/json/i.test(ct)) {
-        console.error('Non-JSON from /api/pubmed:', raw.slice(0, 200))
-        throw new Error('Server returned non-JSON.')
-      }
+      if (!/application\/json/i.test(ct)) throw new Error('Non-JSON response')
       const data = JSON.parse(raw)
       if (!resp.ok) throw new Error(data?.error || 'Failed to fetch')
       setPaper(data.paper || null)
-    } catch (e: any) {
+    } catch (e:any) {
       setErr(e.message || 'Failed to fetch')
       setPaper(null)
     } finally {
       setFetching(false)
-    }
-  }
-
-  /* ======= Multi-Source Literature Agent (Crossref + arXiv + S2) ======= */
-  type LitItem = {
-    id: string
-    source: 'crossref'|'arxiv'|'s2'
-    title: string
-    year?: number
-    authors?: string[]
-    abstract?: string
-    doi?: string
-    url?: string
-    citationCount?: number
-    externalIds?: Record<string, string>
-  }
-
-  const [litQ, setLitQ] = useState('large language models retrieval augmentation')
-  const [litLoading, setLitLoading] = useState(false)
-  const [litErr, setLitErr] = useState<string|null>(null)
-  const [litItems, setLitItems] = useState<LitItem[]>([])
-  const [litTop, setLitTop] = useState<LitItem[]>([])
-
-  // Analysis UI state
-  const [analyzing, setAnalyzing] = useState(false)
-  const [analysisText, setAnalysisText] = useState<string>('')
-
-  async function runMultiSearch() {
-    setLitLoading(true); setLitErr(null)
-    try {
-      const resp = await fetch('/api/lit/multisearch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-        body: JSON.stringify({ query: litQ, limit: 20 })
-      })
-      const text = await resp.text()
-      if (!/application\/json/i.test(resp.headers.get('content-type')||'')) throw new Error('Non-JSON response')
-      const data = JSON.parse(text)
-      if (!resp.ok) throw new Error(data?.error || 'Failed search')
-      setLitItems(data.items || [])
-      setLitTop(data.top || [])
-      setAnalysisText('') // clear previous analysis for new search
-    } catch (e:any) {
-      setLitErr(e.message || 'Failed search')
-      setLitItems([]); setLitTop([])
-    } finally {
-      setLitLoading(false)
     }
   }
 
@@ -577,10 +672,33 @@ function AICopilot({ readme, colabId }: { readme: string; colabId: string }) {
     return out
   }
 
+  async function runMultiSearch() {
+    setLitLoading(true); setLitErr(null)
+    try {
+      const resp = await fetch('/api/lit/multisearch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({ query: litQ, limit: 20 })
+      })
+      const text = await resp.text()
+      if (!/application\/json/i.test(resp.headers.get('content-type')||'')) throw new Error('Non-JSON response')
+      const data = JSON.parse(text)
+      if (!resp.ok) throw new Error(data?.error || 'Failed search')
+      setLitItems(data.items || [])
+      setLitTop(data.top || [])
+      setAnalysisText('')
+    } catch (e:any) {
+      setLitErr(e.message || 'Failed search')
+      setLitItems([]); setLitTop([])
+    } finally {
+      setLitLoading(false)
+    }
+  }
+
   async function analyzeWithGemini() {
     if (!litTop.length) return
     setAnalyzing(true)
-    setAnalysisText('') // reset
+    setAnalysisText('')
     try {
       const literature_context = mkGeminiContext(litTop.slice(0, 10))
       const prompt = `
@@ -598,19 +716,22 @@ Please provide:
 5) A shortlist of 5 must-read papers with rationale
 
 Respond concisely as a structured review with bullet points and numbered citations.
-      `.trim()
+`.trim()
 
       const res = await fetch('/api/ai', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt, colabId, readme })
+        body: JSON.stringify({ prompt, colabId, readme }) // README only
       })
       const data = await res.json()
       const text = data?.text || 'No response'
-      // Push into chat above:
-      setMessages(m => [...m, { role:'user', content: `Analyze multi-source literature for: "${litQ}"` }, { role:'assistant', content: text }])
-      // Also show a copy here:
+      setMessages(m => [
+        ...m,
+        { role:'user', content: `Analyze multi-source literature for: "${litQ}"` },
+        { role:'assistant', content: text }
+      ])
       setAnalysisText(text)
+      setAnalysisDone(true)
     } catch (e:any) {
       setAnalysisText(`Failed to analyze: ${e.message || 'Unknown error'}`)
     } finally {
@@ -620,25 +741,42 @@ Respond concisely as a structured review with bullet points and numbered citatio
 
   return (
     <div className="bg-white border rounded-lg p-4 sm:p-6 space-y-6">
-      {/* Chat-like section */}
       <div className="flex items-center justify-between">
-        <div className="text-sm text-slate-600">Gemini-powered assistant with project context.</div>
+        <div className="text-sm text-slate-600">AI assistant with <strong>README-only</strong> context.</div>
         <button onClick={clearAll} className="text-xs border px-2 py-1 rounded hover:bg-slate-50">Clear</button>
       </div>
+
+      {/* Chat */}
       <div className="space-y-3 max-h-[50vh] overflow-y-auto">
         {messages.map((m, i) => (
-          <div key={i} className={`p-3 rounded-lg text-sm ${m.role==='user'?'bg-slate-50':'bg-blue-50'}`}>{m.content}</div>
+          <div key={i} className={`p-3 rounded-lg text-sm break-words ${m.role==='user'?'bg-slate-50':'bg-blue-50'}`}>
+            {m.role === 'assistant' ? (
+              <>
+                <div className="flex items-center gap-1 text-[11px] text-slate-600 mb-1">
+                  <FiCpu className="w-3 h-3" /><span>AI</span>
+                </div>
+                <FormattedText text={m.content} />
+              </>
+            ) : (
+              <div className="whitespace-pre-wrap break-words">{m.content}</div>
+            )}
+          </div>
         ))}
       </div>
       <div className="flex gap-2">
-        <input value={input} onChange={e=>setInput(e.target.value)} placeholder="Ask anything…" className="flex-1 border rounded-lg px-3 py-2"/>
+        <input
+          value={input}
+          onChange={e=>setInput(e.target.value)}
+          placeholder="Ask anything…"
+          className="flex-1 border rounded-lg px-3 py-2 min-w-0"
+        />
         <button onClick={send} disabled={loading || !input.trim()} className="px-4 py-2 rounded-lg bg-blue-600 text-white disabled:opacity-50">
           {loading? 'Thinking…':'Send'}
         </button>
       </div>
-      <p className="text-xs text-slate-500">We pass README and recent contributions as context. Avoid sharing secrets in prompts.</p>
+      <p className="text-xs text-slate-500">We pass only the README into the AI. Avoid sharing secrets in prompts.</p>
 
-      {/* Quick PubMed (NCBI) Panel */}
+      {/* Quick PubMed (NCBI) */}
       <div className="border-t pt-5">
         <div className="flex items-center justify-between mb-3">
           <h3 className="font-semibold flex items-center gap-2">
@@ -659,7 +797,7 @@ Respond concisely as a structured review with bullet points and numbered citatio
               value={q}
               onChange={(e)=>setQ(e.target.value)}
               placeholder="Search keywords (title/abstract)…"
-              className="flex-1 border rounded-lg px-3 py-2"
+              className="flex-1 border rounded-lg px-3 py-2 min-w-0"
             />
             <button
               onClick={()=>fetchPubMed('query')}
@@ -675,7 +813,7 @@ Respond concisely as a structured review with bullet points and numbered citatio
               value={pmid}
               onChange={(e)=>setPmid(e.target.value)}
               placeholder="PMID (optional)"
-              className="flex-1 border rounded-lg px-3 py-2"
+              className="flex-1 border rounded-lg px-3 py-2 min-w-0"
             />
             <button
               onClick={()=>fetchPubMed('pmid')}
@@ -688,9 +826,7 @@ Respond concisely as a structured review with bullet points and numbered citatio
           </div>
         </div>
 
-        {err && (
-          <div className="mt-3 text-sm text-red-600">{err}</div>
-        )}
+        {err && <div className="mt-3 text-sm text-red-600 break-words">{err}</div>}
 
         {paper && (
           <article className="mt-4 bg-slate-50 border rounded-lg p-4">
@@ -698,19 +834,19 @@ Respond concisely as a structured review with bullet points and numbered citatio
               {paper.pmid && <span className="px-2 py-0.5 rounded bg-white border">PMID: {paper.pmid}</span>}
               {paper.year && <span className="px-2 py-0.5 rounded bg-white border">{paper.year}</span>}
               {paper.journal && <span className="px-2 py-0.5 rounded bg-white border">{paper.journal}</span>}
-              {paper.doi && <span className="px-2 py-0.5 rounded bg-white border">DOI: {paper.doi}</span>}
+              {paper.doi && <span className="px-2 py-0.5 rounded bg-white border break-words">DOI: {paper.doi}</span>}
             </div>
             <h4 className="font-semibold">{paper.title}</h4>
             {paper.authors?.length ? (
-              <div className="text-sm text-slate-700 mt-1">{paper.authors.join(', ')}</div>
+              <div className="text-sm text-slate-700 mt-1 break-words">{paper.authors.join(', ')}</div>
             ) : null}
             {paper.abstract ? (
-              <p className="text-sm text-slate-700 mt-3 whitespace-pre-wrap">{paper.abstract}</p>
+              <p className="text-sm text-slate-700 mt-3 whitespace-pre-wrap break-words">{paper.abstract}</p>
             ) : (
               <p className="text-sm text-slate-500 mt-3">No abstract available.</p>
             )}
             <div className="mt-3">
-              <a href={paper.url} target="_blank" rel="noreferrer" className="text-sm text-blue-700 underline">
+              <a href={paper.url} target="_blank" rel="noreferrer" className="text-sm text-blue-700 underline break-words">
                 View on PubMed
               </a>
             </div>
@@ -718,7 +854,7 @@ Respond concisely as a structured review with bullet points and numbered citatio
         )}
       </div>
 
-      {/* === Multi-Source Literature Agent === */}
+      {/* Literature Agent */}
       <div className="border-t pt-6">
         <div className="flex items-center justify-between mb-3">
           <h3 className="font-semibold">Literature Agent (Crossref + arXiv + Semantic Scholar)</h3>
@@ -736,7 +872,7 @@ Respond concisely as a structured review with bullet points and numbered citatio
               value={litQ}
               onChange={e=>setLitQ(e.target.value)}
               placeholder="e.g., graph neural networks drug discovery"
-              className="flex-1 border rounded-lg px-3 py-2"
+              className="flex-1 border rounded-lg px-3 py-2 min-w-0"
             />
             <button
               onClick={runMultiSearch}
@@ -752,14 +888,14 @@ Respond concisely as a structured review with bullet points and numbered citatio
               onClick={analyzeWithGemini}
               disabled={!litTop.length || analyzing}
               className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border disabled:opacity-50"
-              title="Send top results to Gemini"
+              title="Send top results to AI"
             >
-              {analyzing ? 'Analyzing…' : 'Analyze with Gemini'}
+              {analyzing ? 'Analyzing…' : 'Analyze with AI'}
             </button>
           </div>
         </div>
 
-        {litErr && <div className="mt-3 text-sm text-red-600">{litErr}</div>}
+        {litErr && <div className="mt-3 text-sm text-red-600 break-words">{litErr}</div>}
 
         {Boolean(litTop.length) && (
           <div className="mt-4">
@@ -774,22 +910,22 @@ Respond concisely as a structured review with bullet points and numbered citatio
                     {typeof x.citationCount === 'number' && (
                       <span className="px-2 py-0.5 rounded bg-white border">Citations: {x.citationCount}</span>
                     )}
-                    {x.doi && <span className="px-2 py-0.5 rounded bg-white border">doi:{x.doi}</span>}
+                    {x.doi && <span className="px-2 py-0.5 rounded bg-white border break-words">doi:{x.doi}</span>}
                   </div>
-                  <div className="font-medium">{x.title}</div>
+                  <div className="font-medium break-words">{x.title}</div>
                   {x.authors?.length ? (
-                    <div className="text-sm text-slate-700 mt-0.5">
+                    <div className="text-sm text-slate-700 mt-0.5 break-words">
                       {x.authors.length <= 3 ? x.authors.join(', ') : `${x.authors.slice(0,3).join(', ')} et al.`}
                     </div>
                   ) : null}
                   {x.abstract ? (
-                    <p className="text-sm text-slate-700 mt-2 line-clamp-3">{x.abstract}</p>
+                    <p className="text-sm text-slate-700 mt-2 line-clamp-3 break-words">{x.abstract}</p>
                   ) : (
                     <p className="text-sm text-slate-500 mt-2">No abstract available.</p>
                   )}
                   <div className="mt-2">
                     {x.url ? (
-                      <a href={x.url} target="_blank" rel="noreferrer" className="text-sm text-blue-700 underline">
+                      <a href={x.url} target="_blank" rel="noreferrer" className="text-sm text-blue-700 underline break-words">
                         Open
                       </a>
                     ) : null}
@@ -800,19 +936,23 @@ Respond concisely as a structured review with bullet points and numbered citatio
           </div>
         )}
 
-        {/* Analysis panel */}
         {(analyzing || analysisText) && (
           <div className="mt-6 bg-white border rounded-lg p-4">
-            <div className="text-sm text-slate-600 mb-2">
-              {analyzing
-                ? 'Analyzing with Gemini… this can take a moment.'
-                : 'Analysis ready. It has also been posted in the chat above.'}
-            </div>
-            {!analyzing && analysisText && (
-              <div className="prose prose-sm max-w-none whitespace-pre-wrap">
-                {analysisText}
+            {analysisDone && (
+              <div className="rounded-lg border border-green-200 bg-green-50 text-green-800 p-3 mb-3 flex items-center justify-between" role="status" aria-live="polite">
+                <div className="flex items-center gap-2">
+                  <FiCheck className="shrink-0" />
+                  <span>Literature review analysis completed — also posted in the chat above.</span>
+                </div>
+                <button onClick={()=>setAnalysisDone(false)} className="p-1 rounded hover:bg-green-100" aria-label="Dismiss" title="Dismiss">
+                  <FiX />
+                </button>
               </div>
             )}
+            <div className="text-sm text-slate-600 mb-2">
+              {analyzing ? 'Analyzing…' : 'Analysis ready.'}
+            </div>
+            {!analyzing && analysisText && <FormattedText text={analysisText} />}
           </div>
         )}
       </div>
@@ -826,20 +966,19 @@ function ComingSoon({ title }: { title: string }) {
   )
 }
 
-function Empty({ state, onAdd }: { state: 'contrib'|'notes'; onAdd?: ()=>void }) {
-  const label = state==='contrib'? 'No contributions yet' : 'No research notes yet'
+function Empty({ state, onAdd }: { state: 'notes'; onAdd?: ()=>void }) {
   return (
     <div className="bg-white border rounded-lg p-10 text-center">
-      <p className="font-medium mb-2">{label}</p>
-      <p className="text-slate-600 text-sm mb-4">Be the first to add one.</p>
-      {onAdd && <button onClick={onAdd} className="inline-flex items-center gap-2 bg-slate-900 text-white px-4 py-2 rounded-lg"><FiPlus/> Add</button>}
+      <p className="font-medium mb-2">No threads yet</p>
+      <p className="text-slate-600 text-sm mb-4">Start the first discussion.</p>
+      {onAdd && <button onClick={onAdd} className="inline-flex items-center gap-2 bg-slate-900 text-white px-4 py-2 rounded-lg"><FiPlus/> New thread</button>}
     </div>
   )
 }
 
 function CreateModal({ title, placeholder, onClose, onSubmit }: { title:string; placeholder:string; onClose:()=>void; onSubmit:(v:string)=>Promise<void> }) {
   const [value,setValue]=useState(''); const [busy,setBusy]=useState(false)
-  const submit=async(e:React.FormEvent)=>{ e.preventDefault(); if(!value.trim()) return; setBusy(true); await onSubmit(value); setBusy(false) }
+  const submit=async(e:FormEvent)=>{ e.preventDefault(); if(!value.trim()) return; setBusy(true); await onSubmit(value.trim()); setBusy(false) }
   return (
     <div className="fixed inset-0 bg-black/40 backdrop-blur-sm grid place-items-center p-4 z-50">
       <form onSubmit={submit} className="bg-white rounded-lg w-full max-w-md p-5 space-y-4">
@@ -847,10 +986,10 @@ function CreateModal({ title, placeholder, onClose, onSubmit }: { title:string; 
           <h3 className="text-lg font-semibold">{title}</h3>
           <button type="button" onClick={onClose} className="p-2 rounded-lg hover:bg-slate-100"><FiX/></button>
         </div>
-        <textarea className="w-full border rounded-lg p-3 min-h-[120px] focus:ring-2 focus:ring-blue-500" placeholder={placeholder} value={value} onChange={e=>setValue(e.target.value)} />
+        <textarea className="w-full border rounded-lg p-3 min-h-[120px] focus:ring-2 focus:ring-indigo-500 whitespace-pre-wrap break-words" placeholder={placeholder} value={value} onChange={e=>setValue(e.target.value)} />
         <div className="flex justify-end gap-2">
           <button type="button" onClick={onClose} className="px-4 py-2 rounded-lg border">Cancel</button>
-          <button type="submit" disabled={busy || !value.trim()} className="px-4 py-2 rounded-lg bg-blue-600 text-white disabled:opacity-50">{busy? 'Adding…':'Add'}</button>
+          <button type="submit" disabled={busy || !value.trim()} className="px-4 py-2 rounded-lg bg-indigo-600 text-white disabled:opacity-50">{busy? 'Posting…':'Post'}</button>
         </div>
       </form>
     </div>
