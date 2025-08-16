@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react'
 import { supabase } from '../lib/supabase'
-import { FiPlus, FiHome, FiSettings, FiLogOut, FiMenu, FiX, FiTarget, FiUsers, FiEdit, FiTrash2 } from 'react-icons/fi'
+import { FiPlus, FiHome, FiSettings, FiLogOut, FiMenu, FiX, FiTarget, FiUsers, FiEdit, FiTrash2, FiMessageSquare } from 'react-icons/fi'
 import Link from 'next/link'
 import Image from 'next/image'
 import Header from '@/components/ui/header'
@@ -24,10 +24,14 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(true)
   const [profile, setProfile] = useState<any>(null)
 
-  // NEW: open colabs contributor counts + membership flags
+  // open colabs contributor (member) counts + membership flags
   const [openColabMemberCounts, setOpenColabMemberCounts] = useState<Record<string, number>>({})
   const [joinedIds, setJoinedIds] = useState<Record<string, boolean>>({})
   const [joiningIds, setJoiningIds] = useState<Record<string, boolean>>({})
+
+  // NEW: actual contributions (peer-review notes) per colab
+  const [openColabContributionCounts, setOpenColabContributionCounts] = useState<Record<string, number>>({})
+  const [userColabContributionCounts, setUserColabContributionCounts] = useState<Record<string, number>>({})
 
   const router = useRouter()
 
@@ -39,7 +43,7 @@ export default function DashboardPage() {
         return
       }
 
-      // Fetch user profile
+      // Profile
       const { data: profileData } = await supabase
         .from('profiles')
         .select('*')
@@ -47,17 +51,18 @@ export default function DashboardPage() {
         .single()
       setProfile(profileData)
 
-      // Fetch user's colabs (membership list)
+      // Your colabs (membership accepted)
       const { data: colabData } = await supabase
         .from('colab_members')
         .select('colabs(*)')
         .eq('user_id', user.id)
         .eq('status', 'accepted')
-      setUserColabs(colabData?.map((item: any) => item.colabs) || [])
+      const myColabs = colabData?.map((item: any) => item.colabs) || []
+      setUserColabs(myColabs)
 
-      // Fetch all public colabs (Open Colabs) - FIXED VERSION
+      // Public colabs (with owner mini-profile)
+      let openList: any[] = []
       try {
-        // First, try with the join
         const { data: openColabData, error: joinError } = await supabase
           .from('colabs')
           .select(`
@@ -68,84 +73,106 @@ export default function DashboardPage() {
           .order('created_at', { ascending: false })
           .limit(6)
 
-        let openList = openColabData || []
+        openList = openColabData || []
 
         if (joinError) {
-          console.warn('Join query failed, trying alternative approach:', joinError)
-          
-          // Alternative approach: fetch colabs first, then fetch owner details separately
-          const { data: colabsOnly, error: colabsError } = await supabase
+          // fallback: fetch colabs then owners
+          const { data: colabsOnly } = await supabase
             .from('colabs')
             .select('*')
             .eq('is_public', true)
             .order('created_at', { ascending: false })
             .limit(6)
 
-          if (colabsError) {
-            console.error('Error fetching colabs:', colabsError)
-            openList = []
-          } else if (colabsOnly && colabsOnly.length > 0) {
-            // Fetch owner details separately
-            const ownerIds = Array.from(new Set(colabsOnly.map(colab => colab.owner_id)))
+          if (colabsOnly?.length) {
+            const ownerIds = Array.from(new Set(colabsOnly.map((c: any) => c.owner_id)))
             const { data: ownersData } = await supabase
               .from('profiles')
               .select('id, full_name, username, avatar_url')
               .in('id', ownerIds)
 
-            // Combine colab data with owner data
-            openList = colabsOnly.map(colab => ({
+            openList = (colabsOnly || []).map((colab: any) => ({
               ...colab,
-              profiles: ownersData?.find((owner: any) => owner.id === colab.owner_id) || null
+              profiles: ownersData?.find((o: any) => o.id === colab.owner_id) || null
             }))
           } else {
             openList = []
           }
         }
+      } catch (e) {
+        console.error('Error in open colabs fetch:', e)
+        openList = []
+      }
+      setOpenColabs(openList)
 
-        setOpenColabs(openList)
+      // ---- Counts + membership flags for open colabs ----
+      const openIds = openList.map((c: any) => c.id)
 
-        // ---- NEW: real contributor counts & membership status for this user ----
-        const ids = openList.map((c: any) => c.id)
+      if (openIds.length) {
+        // members per open colab
+        const memberCounts: Record<string, number> = {}
+        await Promise.all(
+          openIds.map(async (id: string) => {
+            const { count } = await supabase
+              .from('colab_members')
+              .select('id', { count: 'exact', head: true })
+              .eq('colab_id', id)
+              .eq('status', 'accepted')
+            memberCounts[id] = count || 0
+          })
+        )
+        setOpenColabMemberCounts(memberCounts)
 
-        if (ids.length) {
-          // Count contributors (members) per colab (status accepted)
-          const memberCounts: Record<string, number> = {}
-          await Promise.all(
-            ids.map(async (id: string) => {
-              const { count } = await supabase
-                .from('colab_members')
-                .select('id', { count: 'exact', head: true })
-                .eq('colab_id', id)
-                .eq('status', 'accepted')
-              memberCounts[id] = count || 0
-            })
-          )
-          setOpenColabMemberCounts(memberCounts)
+        // contributions per open colab (count research_notes rows)
+        const contribCounts: Record<string, number> = {}
+        await Promise.all(
+          openIds.map(async (id: string) => {
+            const { count } = await supabase
+              .from('research_notes')
+              .select('id', { count: 'exact', head: true })
+              .eq('colab_id', id)
+            contribCounts[id] = count || 0
+          })
+        )
+        setOpenColabContributionCounts(contribCounts)
 
-          // Check if current user already joined each open colab
-          const { data: myMemberships } = await supabase
-            .from('colab_members')
-            .select('colab_id')
-            .in('colab_id', ids)
-            .eq('user_id', user.id)
-            .eq('status', 'accepted')
+        // did current user join?
+        const { data: myMemberships } = await supabase
+          .from('colab_members')
+          .select('colab_id')
+          .in('colab_id', openIds)
+          .eq('user_id', user.id)
+          .eq('status', 'accepted')
 
-          const joined: Record<string, boolean> = {}
-          myMemberships?.forEach((m: any) => { joined[m.colab_id] = true })
-          setJoinedIds(joined)
-        } else {
-          setOpenColabMemberCounts({})
-          setJoinedIds({})
-        }
-        // ----------------------------------------------------------------------
-      } catch (error) {
-        console.error('Error in open colabs fetch:', error)
-        setOpenColabs([])
+        const joined: Record<string, boolean> = {}
+        myMemberships?.forEach((m: any) => { joined[m.colab_id] = true })
+        setJoinedIds(joined)
+      } else {
         setOpenColabMemberCounts({})
+        setOpenColabContributionCounts({})
         setJoinedIds({})
       }
+      // ----------------------------------------------------
 
-      // Fetch challenges
+      // contributions for "Your Colabs"
+      if (myColabs.length) {
+        const myIds = myColabs.map((c: any) => c.id)
+        const myContribCounts: Record<string, number> = {}
+        await Promise.all(
+          myIds.map(async (id: string) => {
+            const { count } = await supabase
+              .from('research_notes')
+              .select('id', { count: 'exact', head: true })
+              .eq('colab_id', id)
+            myContribCounts[id] = count || 0
+          })
+        )
+        setUserColabContributionCounts(myContribCounts)
+      } else {
+        setUserColabContributionCounts({})
+      }
+
+      // Challenges
       const { data: challengeData } = await supabase
         .from('challenges')
         .select('*')
@@ -177,7 +204,8 @@ export default function DashboardPage() {
         slug,
         description,
         readme,
-        owner_id: user.id
+        owner_id: user.id,
+        is_public: true // sensible default for visibility on dashboard; tweak if needed
       }])
       .select()
       .single()
@@ -223,7 +251,6 @@ export default function DashboardPage() {
       return
     }
 
-    // Update the local state
     setUserColabs(userColabs.map(colab => 
       colab.id === editingColab.id ? data : colab
     ))
@@ -234,7 +261,6 @@ export default function DashboardPage() {
   const handleDeleteColab = async () => {
     if (!deletingColab) return
 
-    // Delete colab members first
     const { error: membersError } = await supabase
       .from('colab_members')
       .delete()
@@ -245,7 +271,6 @@ export default function DashboardPage() {
       return
     }
 
-    // Delete the colab
     const { error } = await supabase
       .from('colabs')
       .delete()
@@ -256,7 +281,6 @@ export default function DashboardPage() {
       return
     }
 
-    // Update local state
     setUserColabs(userColabs.filter(colab => colab.id !== deletingColab.id))
     setShowDeleteConfirm(false)
     setDeletingColab(null)
@@ -272,7 +296,7 @@ export default function DashboardPage() {
     setShowDeleteConfirm(true)
   }
 
-  // NEW: join a public colab
+  // join a public colab
   const handleJoinColab = async (colabId: string) => {
     const { data: { user } } = await supabase.auth.getUser()
     if (!user) { router.push('/signin'); return }
@@ -285,7 +309,6 @@ export default function DashboardPage() {
           { colab_id: colabId, user_id: user.id, role: 'member', status: 'accepted' },
           { onConflict: 'colab_id,user_id' }
         )
-      // mark joined and optimistically bump contributors
       setJoinedIds(prev => ({ ...prev, [colabId]: true }))
       setOpenColabMemberCounts(prev => ({ ...prev, [colabId]: (prev[colabId] || 0) + 1 }))
     } catch (e) {
@@ -295,12 +318,11 @@ export default function DashboardPage() {
     }
   }
 
-  // Debug function - you can remove this after testing
+  // Debug (optional)
   const debugOpenColabs = () => {
     console.log('Open Colabs Data:', openColabs)
-    console.log('Loading:', loading)
-    console.log('Open Colabs Length:', openColabs.length)
     console.log('Contributors map:', openColabMemberCounts)
+    console.log('Contributions map:', openColabContributionCounts)
     console.log('Joined map:', joinedIds)
   }
 
@@ -409,7 +431,7 @@ export default function DashboardPage() {
       <div className="flex-1 flex flex-col overflow-hidden">
         <div className="flex-1 overflow-auto p-4 md:p-6">
           <div className="max-w-7xl mx-auto space-y-6">
-            {/* Welcome section */}
+            {/* Welcome */}
             <div className="bg-white p-6 rounded-xl shadow-sm">
               <h1 className="text-2xl md:text-3xl font-bold text-gray-900 mb-2">
                 Welcome back, {profile?.full_name?.split(' ')[0] || 'Researcher'}!
@@ -474,7 +496,7 @@ export default function DashboardPage() {
               )}
             </div>
             
-            {/* Two column layout */}
+            {/* Two columns */}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
               {/* Your Colabs */}
               <div className="bg-white p-6 rounded-xl shadow-sm">
@@ -500,46 +522,53 @@ export default function DashboardPage() {
                   </div>
                 ) : userColabs.length > 0 ? (
                   <div className="space-y-3">
-                    {userColabs.slice(0, 4).map(colab => (
-                      <div key={colab.id} className="border border-gray-200 rounded-lg p-4 hover:border-blue-200 transition-colors">
-                        <div className="flex items-center justify-between mb-2">
-                          <div className="flex-1">
-                            <h3 className="text-md font-semibold text-blue-600 hover:text-blue-700 mb-1">
-                              <Link href={`/colab/${colab.slug}`}>{colab.name}</Link>
-                            </h3>
-                            <p className="text-sm text-gray-600 line-clamp-2 mb-2">
-                              {colab.description || 'No description available'}
-                            </p>
-                            <div className="flex items-center gap-2 text-xs">
-                              <span className="bg-blue-100 text-blue-700 px-2 py-1 rounded-full">
-                                {colab.is_public ? 'Public' : 'Private'}
-                              </span>
-                              <span className="text-gray-500">
-                                Created {new Date(colab.created_at).toLocaleDateString()}
-                              </span>
+                    {userColabs.slice(0, 4).map(colab => {
+                      const contributions = userColabContributionCounts[colab.id] ?? 0
+                      return (
+                        <div key={colab.id} className="border border-gray-200 rounded-lg p-4 hover:border-blue-200 transition-colors">
+                          <div className="flex items-center justify-between mb-2">
+                            <div className="flex-1">
+                              <h3 className="text-md font-semibold text-blue-600 hover:text-blue-700 mb-1">
+                                <Link href={`/colab/${colab.slug}`}>{colab.name}</Link>
+                              </h3>
+                              <p className="text-sm text-gray-600 line-clamp-2 mb-2">
+                                {colab.description || 'No description available'}
+                              </p>
+                              <div className="flex items-center gap-2 text-xs">
+                                <span className="bg-blue-100 text-blue-700 px-2 py-1 rounded-full">
+                                  {colab.is_public ? 'Public' : 'Private'}
+                                </span>
+                                <span className="text-gray-500">
+                                  Created {new Date(colab.created_at).toLocaleDateString()}
+                                </span>
+                                <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-gray-100 text-gray-700">
+                                  <FiMessageSquare className="w-3.5 h-3.5" />
+                                  {contributions} contributions
+                                </span>
+                              </div>
+                            </div>
+                            
+                            {/* Actions */}
+                            <div className="flex items-center gap-1 ml-3">
+                              <button
+                                onClick={() => openEditModal(colab)}
+                                className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
+                                title="Edit colab"
+                              >
+                                <FiEdit className="w-4 h-4" />
+                              </button>
+                              <button
+                                onClick={() => openDeleteConfirm(colab)}
+                                className="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
+                                title="Delete colab"
+                              >
+                                <FiTrash2 className="w-4 h-4" />
+                              </button>
                             </div>
                           </div>
-                          
-                          {/* Action buttons */}
-                          <div className="flex items-center gap-1 ml-3">
-                            <button
-                              onClick={() => openEditModal(colab)}
-                              className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
-                              title="Edit colab"
-                            >
-                              <FiEdit className="w-4 h-4" />
-                            </button>
-                            <button
-                              onClick={() => openDeleteConfirm(colab)}
-                              className="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
-                              title="Delete colab"
-                            >
-                              <FiTrash2 className="w-4 h-4" />
-                            </button>
-                          </div>
                         </div>
-                      </div>
-                    ))}
+                      )
+                    })}
                   </div>
                 ) : (
                   <div className="bg-gray-50 rounded-lg p-6 text-center">
@@ -556,7 +585,7 @@ export default function DashboardPage() {
                 )}
               </div>
               
-              {/* Open Colabs - with real contributor counts + joined/view actions */}
+              {/* Open Colabs (with real contributions + members + joined) */}
               <div className="bg-white p-6 rounded-xl shadow-sm">
                 <div className="flex items-center justify-between mb-6">
                   <div className="flex items-center gap-3">
@@ -569,7 +598,6 @@ export default function DashboardPage() {
                     <Link href="/colabs/explore" className="text-blue-600 hover:text-blue-700 font-medium text-sm">
                       Explore all
                     </Link>
-                    {/* Debug button - remove after testing */}
                     <button 
                       onClick={debugOpenColabs}
                       className="text-xs text-gray-400 hover:text-gray-600"
@@ -590,6 +618,7 @@ export default function DashboardPage() {
                   <div className="space-y-3">
                     {openColabs.slice(0, 3).map(colab => {
                       const memberCount = openColabMemberCounts[colab.id] ?? 0
+                      const contributions = openColabContributionCounts[colab.id] ?? 0
                       const alreadyMember = !!joinedIds[colab.id]
                       const joining = !!joiningIds[colab.id]
 
@@ -598,7 +627,7 @@ export default function DashboardPage() {
                           <div className="flex items-center gap-3 mb-3">
                             <div className="w-8 h-8 rounded-full bg-gradient-to-r from-blue-500 to-purple-600 flex items-center justify-center overflow-hidden">
                               {colab.profiles?.avatar_url ? (
-                                <img src={colab.profiles.avatar_url} alt="Profile" className="w-full h-full object-cover" />
+                                <img src={colab.profiles.avatar_url} alt="Owner" className="w-full h-full object-cover" />
                               ) : (
                                 <span className="text-xs text-white font-medium">
                                   {(colab.profiles?.full_name || colab.profiles?.username || 'U')[0].toUpperCase()}
@@ -622,46 +651,21 @@ export default function DashboardPage() {
                             {colab.description || 'No description available'}
                           </p>
                           
+                          {/* badges: REMOVED "Open Source"; show contributions + members */}
                           <div className="flex items-center gap-2 text-xs mb-3">
-                            <span className="bg-green-100 text-green-700 px-2 py-1 rounded-full">
-                              Open Source
+                            <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-gray-100 text-gray-700">
+                              <FiMessageSquare className="w-3.5 h-3.5" />
+                              {contributions} contributions
                             </span>
-                            <span className="text-gray-600 px-2 py-1 rounded-full bg-gray-50 border border-gray-200">
-                              {memberCount} contributors
-                            </span>
+                           
                           </div>
 
-                          <div className="flex items-center gap-2">
-                            {alreadyMember ? (
-                              <>
-                                <span className="inline-flex items-center justify-center px-3 py-2 rounded-lg bg-gray-100 text-gray-600 text-sm font-medium cursor-default">
-                                  Joined
-                                </span>
-                                <Link
+                           <Link
                                   href={`/colab/${colab.slug}`}
                                   className="inline-flex items-center justify-center px-3 py-2 rounded-lg border text-sm font-medium hover:bg-gray-50"
                                 >
                                   View
                                 </Link>
-                              </>
-                            ) : (
-                              <>
-                                <button
-                                  onClick={() => handleJoinColab(colab.id)}
-                                  disabled={joining}
-                                  className="inline-flex items-center justify-center px-3 py-2 rounded-lg bg-green-600 hover:bg-green-700 text-white text-sm font-medium disabled:opacity-60"
-                                >
-                                  {joining ? 'Joining…' : 'Join'}
-                                </button>
-                                <Link
-                                  href={`/colab/${colab.slug}`}
-                                  className="inline-flex items-center justify-center px-3 py-2 rounded-lg border text-sm font-medium hover:bg-gray-50"
-                                >
-                                  View
-                                </Link>
-                              </>
-                            )}
-                          </div>
                         </div>
                       )
                     })}

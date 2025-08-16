@@ -5,19 +5,37 @@ import { useRouter, useParams } from 'next/navigation'
 import { supabase } from '../../lib/supabase'
 import Link from 'next/link'
 import {
-  FiHome, FiCpu, FiTerminal, FiUsers, FiPlus, FiX, FiCalendar,
+  FiHome, FiCpu, FiUsers, FiPlus, FiX, FiCalendar,
   FiLock, FiGlobe, FiArrowLeft, FiEdit2, FiTrash2, FiCheck, FiCornerUpRight,
-  FiZap, FiShield, FiBarChart2, FiArrowUp, FiDownload, FiCopy
+  FiZap, FiShield, FiBarChart2, FiArrowUp, FiDownload, FiCopy,
+  FiMapPin, FiBriefcase, FiTwitter, FiLinkedin, FiGithub, FiUser
 } from 'react-icons/fi'
 
 /** ---------- Types ---------- */
 interface Colab { id: string; name: string; slug: string; description: string; readme: string; is_public: boolean; owner_id: string }
-interface Profile { id: string; username: string; full_name: string; avatar_url: string | null; bio?: string; role?: string }
+interface Profile {
+  id: string
+  username: string
+  full_name: string
+  avatar_url: string | null
+  bio?: string
+  role?: string
+  institution?: string
+  location?: string
+  twitter_url?: string
+  linkedin_url?: string
+  github_url?: string
+  website_url?: string
+  interests?: string[]
+}
 interface NoteRow { id: string; colab_id: string; user_id: string; content: string; created_at: string; parent_id: string | null }
 interface ResearchNote extends NoteRow { user: Profile }
 
 type PlanTier = 'free' | 'pro' | 'team'
 type UsageKind = 'ai_messages' | 'lit_searches' | 'analyses'
+
+type RoleLabel = 'Owner' | 'Moderator' | 'Member' | 'Contributor'
+interface Contributor { profile: Profile; roleLabel: RoleLabel }
 
 /** ---------- Limits by plan (client view; enforce on server too) ---------- */
 const PLAN_LIMITS: Record<PlanTier, Record<UsageKind, number>> = {
@@ -31,6 +49,8 @@ const periodKey = () => {
   const d = new Date()
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}`
 }
+const titleCase = (s?: string | null): string =>
+  (s || '').replace(/(^|[_\-\s])([a-z])/gi, (_, p1, p2) => (p1 ? ' ' : '') + p2.toUpperCase()) || ''
 
 /** ---------- Usage hook (Supabase-backed per user) ---------- */
 function useUsage(userId: string | null) {
@@ -98,9 +118,7 @@ function useUsage(userId: string | null) {
           .insert({ user_id: userId, period: pKey })
           .select('id')
           .maybeSingle()
-      } catch {
-        // Row might already exist, ignore error
-      }
+      } catch {}
 
       const { error: updErr } = await supabase
         .rpc('increment_usage', { p_user_id: userId, p_period: pKey, p_column: col, p_amount: amount })
@@ -108,7 +126,6 @@ function useUsage(userId: string | null) {
 
       setUsed(prev => ({ ...prev, [kind]: (prev[kind] ?? 0) + amount }))
     } catch {
-      // soft fallback — optimistic
       setUsed(prev => ({ ...prev, [kind]: (prev[kind] ?? 0) + amount }))
     }
   }
@@ -125,6 +142,9 @@ export default function ColabPage() {
   const [sessionUser, setSessionUser] = useState<{ id: string } | null>(null)
   const [userRole, setUserRole] = useState<string | null>(null)
   const [researchNotes, setResearchNotes] = useState<ResearchNote[]>([])
+  const [contributors, setContributors] = useState<Contributor[]>([])
+  const [previewProfile, setPreviewProfile] = useState<Profile | null>(null)
+
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [showNoteModal, setShowNoteModal] = useState(false)
@@ -132,13 +152,14 @@ export default function ColabPage() {
 
   const router = useRouter()
   const { slug } = useParams() as { slug?: string }
-  const [currentSection, setCurrentSection] = useState<'overview'|'peer-review'|'ai-copilot'|'compute-sandbox'>('overview')
+  const [currentSection, setCurrentSection] = useState<'overview'|'peer-review'|'contributors'|'ai-copilot'>('overview')
 
   const sessionUserId = sessionUser?.id || null
 
   const canCreate = useMemo(() => {
     if (!colab || !sessionUser) return false
     if (userRole === 'owner' || userRole === 'moderator' || userRole === 'member') return true
+    // allow any signed-in user to contribute if colab is public
     return !!colab.is_public
   }, [colab, sessionUser, userRole])
 
@@ -155,23 +176,86 @@ export default function ColabPage() {
         if (colabError || !colabData) throw new Error(colabError?.message || 'Colab not found')
         setColab(colabData as Colab)
 
+        // Fetch creator with extended profile fields so we can show rich info
         const { data: creatorData } = await supabase
           .from('profiles')
-          .select('id, username, full_name, avatar_url, bio, role')
+          .select('id, username, full_name, avatar_url, bio, role, institution, location, twitter_url, linkedin_url, github_url, website_url, interests')
           .eq('id', colabData.owner_id)
           .single()
         setCreator(creatorData as Profile)
 
-        const { data: memberData, error: memberError } = await supabase
+        // Current user's role in this colab
+        const { data: memberRow, error: memberError } = await supabase
           .from('colab_members').select('role').eq('colab_id', colabData.id).eq('user_id', user.id).maybeSingle()
-        if (!memberError) setUserRole(memberData?.role || null)
+        if (!memberError) setUserRole(memberRow?.role || null)
 
+        // All members (for contributors list)
+        const { data: memberList } = await supabase
+          .from('colab_members')
+          .select('user_id, role, user:profiles(id, username, full_name, avatar_url, bio, institution, location, twitter_url, linkedin_url, github_url, website_url, interests)')
+          .eq('colab_id', colabData.id)
+
+        // Peer-review notes (and their authors)
         const { data: notesData } = await supabase
           .from('research_notes')
           .select('*, user:profiles(id, username, full_name, avatar_url)')
           .eq('colab_id', colabData.id)
           .order('created_at', { ascending: true })
-        setResearchNotes((notesData || []) as ResearchNote[])
+
+        const notes = (notesData || []) as ResearchNote[]
+        setResearchNotes(notes)
+
+        // Build contributor set: members + all note authors + owner
+        const byId = new Map<string, Contributor>()
+        const memberRoleById = new Map<string, string>()
+
+        ;(memberList || []).forEach((m: any) => {
+          const p: Profile = m.user
+          if (!p) return
+          const roleLabel: RoleLabel =
+            p.id === colabData.owner_id ? 'Owner' :
+            (m.role === 'moderator' ? 'Moderator' :
+              (m.role === 'member' ? 'Member' : 'Contributor'))
+          byId.set(p.id, { profile: p, roleLabel })
+          memberRoleById.set(p.id, m.role)
+        })
+
+        // Add owner if missing from members
+        if (creatorData && !byId.has(creatorData.id)) {
+          byId.set(creatorData.id, { profile: creatorData as Profile, roleLabel: 'Owner' })
+        }
+
+        // Collect note authors
+        const authorIds = new Set<string>()
+        for (const n of notes) {
+          const uid = n.user?.id || n.user_id
+          if (uid) authorIds.add(uid)
+        }
+        // Fetch extended profiles for note authors not already in byId
+        const extraIds = Array.from(authorIds).filter(id => !byId.has(id))
+        if (extraIds.length) {
+          const { data: extraProfiles } = await supabase
+            .from('profiles')
+            .select('id, username, full_name, avatar_url, bio, institution, location, twitter_url, linkedin_url, github_url, website_url, interests')
+            .in('id', extraIds)
+          ;(extraProfiles || []).forEach((p: any) => {
+            const roleLabel: RoleLabel = p.id === colabData.owner_id ? 'Owner' : 'Contributor'
+            byId.set(p.id, { profile: p as Profile, roleLabel })
+          })
+        }
+
+        // Normalize roles (ensure owner labeled Owner even if member says 'moderator' etc.)
+        if (colabData.owner_id && byId.has(colabData.owner_id)) {
+          const ownerC = byId.get(colabData.owner_id)!
+          byId.set(colabData.owner_id, { ...ownerC, roleLabel: 'Owner' })
+        }
+
+        // Sort: Owner → Moderator → Member → Contributor → name
+        const order: Record<RoleLabel, number> = { Owner: 0, Moderator: 1, Member: 2, Contributor: 3 }
+        const list = Array.from(byId.values())
+          .sort((a, b) => (order[a.roleLabel] - order[b.roleLabel]) || (a.profile.full_name || a.profile.username).localeCompare(b.profile.full_name || b.profile.username))
+
+        setContributors(list)
       } catch (err: any) {
         setError(err.message || 'Failed to load colab')
       } finally { setLoading(false) }
@@ -186,7 +270,26 @@ export default function ColabPage() {
       .insert({ colab_id: colab.id, user_id: sessionUser.id, content, parent_id: parentId })
       .select('*, user:profiles(id, username, full_name, avatar_url)')
       .single()
-    if (!error && data) setResearchNotes(prev => [...prev, data as ResearchNote])
+    if (!error && data) {
+      setResearchNotes(prev => [...prev, data as ResearchNote])
+
+      // ensure the posting user shows as contributor
+      if (!contributors.find(c => c.profile.id === sessionUser.id)) {
+        // fetch full profile once, with rich fields
+        const { data: prof } = await supabase
+          .from('profiles')
+          .select('id, username, full_name, avatar_url, bio, institution, location, twitter_url, linkedin_url, github_url, website_url, interests')
+          .eq('id', sessionUser.id)
+          .single()
+        if (prof) {
+          const roleLabel: RoleLabel =
+            sessionUser.id === colab.owner_id ? 'Owner' :
+            (userRole === 'moderator' ? 'Moderator' :
+              (userRole === 'member' ? 'Member' : 'Contributor'))
+          setContributors(prev => [...prev, { profile: prof as Profile, roleLabel }])
+        }
+      }
+    }
     setShowNoteModal(false)
   }
 
@@ -268,8 +371,8 @@ export default function ColabPage() {
   const sections = [
     { id: 'overview', label: 'Overview', icon: FiHome, count: null },
     { id: 'peer-review', label: 'Peer Review', icon: FiUsers, count: researchNotes.length },
+    { id: 'contributors', label: 'Contributors', icon: FiUser, count: contributors.length },
     { id: 'ai-copilot', label: 'AI Co-Pilot', icon: FiCpu, count: null },
-    { id: 'compute-sandbox', label: 'Compute', icon: FiTerminal, count: null },
   ] as const
 
   return (
@@ -292,7 +395,6 @@ export default function ColabPage() {
               </div>
             </div>
           </div>
-          {/* Join removed */}
           <div className="w-10" />
         </div>
         <div className="border-t">
@@ -326,7 +428,7 @@ export default function ColabPage() {
           <section className="space-y-4">
             <div className="flex items-center justify-between">
               <h2 className="text-xl font-semibold">Peer Review</h2>
-              {(userRole === 'owner' || userRole === 'moderator' || userRole === 'member') && (
+              {canCreate && (
                 <button
                   onClick={()=>setShowNoteModal(true)}
                   className="hidden sm:inline-flex items-center gap-2 bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700">
@@ -355,9 +457,16 @@ export default function ColabPage() {
                 ))}
               </ul>
             ) : (
-              <Empty state="notes" onAdd={(userRole === 'owner' || userRole === 'moderator' || userRole === 'member') ? ()=>setShowNoteModal(true):undefined} />
+              <Empty state="notes" onAdd={canCreate ? ()=>setShowNoteModal(true):undefined} />
             )}
           </section>
+        )}
+
+        {currentSection === 'contributors' && (
+          <ContributorsSection
+            contributors={contributors}
+            onPreview={(p)=>setPreviewProfile(p)}
+          />
         )}
 
         {currentSection === 'ai-copilot' && (
@@ -367,12 +476,10 @@ export default function ColabPage() {
             userId={sessionUserId}
           />
         )}
-
-        {currentSection === 'compute-sandbox' && <ComingSoon title="Compute Sandbox"/>}
       </main>
 
       {/* FAB mobile */}
-      {(userRole === 'owner' || userRole === 'moderator' || userRole === 'member') && currentSection==='peer-review' && (
+      {canCreate && currentSection==='peer-review' && (
         <div className="sm:hidden fixed bottom-5 right-5 z-50">
           <button
             onClick={()=>setShowNoteModal(true)}
@@ -389,6 +496,10 @@ export default function ColabPage() {
           onClose={()=>setShowNoteModal(false)}
           onSubmit={(v)=>handleCreateNote(v, null)}
         />
+      )}
+
+      {previewProfile && (
+        <ProfilePreviewModal profile={previewProfile} onClose={()=>setPreviewProfile(null)} />
       )}
     </div>
   )
@@ -431,6 +542,151 @@ function Overview({ colab, creator, role }: { colab: Colab; creator: Profile | n
           ) : (
             <div className="text-slate-500">No README yet.</div>
           )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/* ---------- Contributors ---------- */
+function ContributorsSection({
+  contributors,
+  onPreview
+}: {
+  contributors: Contributor[],
+  onPreview: (p: Profile) => void
+}) {
+  return (
+    <section className="space-y-4">
+      <div className="flex items-center justify-between">
+        <h2 className="text-xl font-semibold">Contributors</h2>
+        <div className="text-sm text-slate-600">{contributors.length} people</div>
+      </div>
+
+      {contributors.length === 0 ? (
+        <div className="bg-white border rounded-lg p-10 text-center">
+          <p className="font-medium mb-2">No contributors yet</p>
+          <p className="text-slate-600 text-sm">Start a thread in Peer Review to appear here.</p>
+        </div>
+      ) : (
+        <ul className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          {contributors.map(({ profile, roleLabel }) => (
+            <li key={profile.id} className="bg-white border rounded-lg p-4 flex flex-col">
+              <div className="flex items-start gap-3">
+                <div className="w-12 h-12 rounded-full overflow-hidden bg-gradient-to-br from-blue-500 to-purple-600 grid place-items-center shrink-0">
+                  {profile.avatar_url
+                    ? <img src={profile.avatar_url} alt={profile.full_name || profile.username} className="w-full h-full object-cover"/>
+                    : <span className="text-white font-semibold">{(profile.full_name?.[0] || profile.username?.[0] || 'U').toUpperCase()}</span>}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <h3 className="font-semibold truncate">{profile.full_name || 'Anonymous'}</h3>
+                    <span className={`text-[11px] px-2 py-0.5 rounded-full border ${roleLabel==='Owner' ? 'bg-yellow-50 border-yellow-200 text-yellow-800' :
+                      roleLabel==='Moderator' ? 'bg-purple-50 border-purple-200 text-purple-800' :
+                      roleLabel==='Member' ? 'bg-blue-50 border-blue-200 text-blue-800' :
+                      'bg-slate-50 border-slate-200 text-slate-700'}`}>
+                      {roleLabel}
+                    </span>
+                  </div>
+                  <div className="text-xs text-slate-600 truncate">@{profile.username}</div>
+
+                  <div className="mt-2 flex flex-wrap items-center gap-3 text-sm text-slate-700">
+                    {profile.location && (
+                      <span className="inline-flex items-center gap-1"><FiMapPin className="w-3.5 h-3.5"/>{profile.location}</span>
+                    )}
+                    {profile.institution && (
+                      <span className="inline-flex items-center gap-1"><FiBriefcase className="w-3.5 h-3.5"/>{profile.institution}</span>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {profile.bio && (
+                <p className="mt-3 text-sm text-slate-700 line-clamp-3">{profile.bio}</p>
+              )}
+
+              {Array.isArray(profile.interests) && profile.interests.length > 0 && (
+                <div className="mt-3 flex flex-wrap gap-1.5">
+                  {profile.interests.slice(0,3).map((i) => (
+                    <span key={i} className="px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 text-xs">{i}</span>
+                  ))}
+                </div>
+              )}
+
+              <div className="mt-3 flex items-center gap-3 text-slate-600">
+                {profile.twitter_url && <a href={profile.twitter_url} target="_blank" rel="noreferrer" className="hover:text-slate-900" title="Twitter"><FiTwitter/></a>}
+                {profile.linkedin_url && <a href={profile.linkedin_url} target="_blank" rel="noreferrer" className="hover:text-slate-900" title="LinkedIn"><FiLinkedin/></a>}
+                {profile.github_url && <a href={profile.github_url} target="_blank" rel="noreferrer" className="hover:text-slate-900" title="GitHub"><FiGithub/></a>}
+                {profile.website_url && <a href={profile.website_url} target="_blank" rel="noreferrer" className="hover:text-slate-900" title="Website"><FiGlobe/></a>}
+              </div>
+
+              <div className="mt-4">
+                <button
+                  onClick={()=>onPreview(profile)}
+                  className="text-sm inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border hover:bg-slate-50">
+                  View profile
+                </button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  )
+}
+
+function ProfilePreviewModal({ profile, onClose }: { profile: Profile, onClose: ()=>void }) {
+  return (
+    <div className="fixed inset-0 bg-black/40 backdrop-blur-sm grid place-items-center p-4 z-50">
+      <div className="bg-white rounded-2xl w-full max-w-lg overflow-hidden border">
+        <div className="px-5 py-4 border-b flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-12 h-12 rounded-full overflow-hidden bg-gradient-to-br from-blue-500 to-purple-600 grid place-items-center">
+              {profile.avatar_url
+                ? <img src={profile.avatar_url} alt={profile.full_name || profile.username} className="w-full h-full object-cover"/>
+                : <span className="text-white font-semibold">{(profile.full_name?.[0] || profile.username?.[0] || 'U').toUpperCase()}</span>}
+            </div>
+            <div>
+              <div className="font-semibold">{profile.full_name || 'Anonymous'}</div>
+              <div className="text-xs text-slate-600">@{profile.username}</div>
+            </div>
+          </div>
+          <button onClick={onClose} className="p-2 rounded hover:bg-slate-100"><FiX/></button>
+        </div>
+
+        <div className="p-5 space-y-4">
+          <div className="flex flex-wrap items-center gap-4 text-sm text-slate-700">
+            {profile.location && <span className="inline-flex items-center gap-2"><FiMapPin/>{profile.location}</span>}
+            {profile.institution && <span className="inline-flex items-center gap-2"><FiBriefcase/>{profile.institution}</span>}
+          </div>
+
+          {profile.bio && (
+            <div>
+              <h4 className="text-sm font-semibold mb-1">About</h4>
+              <p className="text-slate-700 whitespace-pre-wrap">{profile.bio}</p>
+            </div>
+          )}
+
+          {Array.isArray(profile.interests) && profile.interests.length > 0 && (
+            <div>
+              <h4 className="text-sm font-semibold mb-1">Interests</h4>
+              <div className="flex flex-wrap gap-2">
+                {profile.interests.map((i) => (
+                  <span key={i} className="px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 text-xs">{i}</span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div>
+            <h4 className="text-sm font-semibold mb-1">Links</h4>
+            <div className="flex items-center gap-3 text-slate-700">
+              {profile.twitter_url ? <a href={profile.twitter_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 hover:underline"><FiTwitter/> Twitter</a> : <span className="text-slate-400">Twitter —</span>}
+              {profile.linkedin_url ? <a href={profile.linkedin_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 hover:underline"><FiLinkedin/> LinkedIn</a> : <span className="text-slate-400">LinkedIn —</span>}
+              {profile.github_url ? <a href={profile.github_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 hover:underline"><FiGithub/> GitHub</a> : <span className="text-slate-400">GitHub —</span>}
+              {profile.website_url ? <a href={profile.website_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 hover:underline"><FiGlobe/> Website</a> : <span className="text-slate-400">Website —</span>}
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -689,18 +945,17 @@ function AICopilot({ readme, colabId, userId }: { readme: string; colabId: strin
   }
 
   // Always include README + memory in context
- function makeAIPayload(userPrompt: string) {
-  const contextBits: string[] = []
-  if (readme?.trim()) contextBits.push(`README:\n${readme.trim()}`)
-  if (litMemory?.trim()) contextBits.push(`LATEST_LIT_ANALYSIS:\n${litMemory.trim()}`)
-  
-  return {
-    prompt: userPrompt,
-    colabId,
-    readme: contextBits.join('\n\n'), // Use 'readme' field instead of 'context'
-    history: messages.slice(-12),
+  function makeAIPayload(userPrompt: string) {
+    const contextBits: string[] = []
+    if (readme?.trim()) contextBits.push(`README:\n${readme.trim()}`)
+    if (litMemory?.trim()) contextBits.push(`LATEST_LIT_ANALYSIS:\n${litMemory.trim()}`)
+    return {
+      prompt: userPrompt,
+      colabId,
+      readme: contextBits.join('\n\n'),
+      history: messages.slice(-12),
+    }
   }
-}
 
   const send = async () => {
     if (!input.trim()) return
