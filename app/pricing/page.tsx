@@ -26,13 +26,11 @@ const PLAN_LIMITS: Record<PlanTier, Record<UsageKind, number>> = {
 const PLAN_RULES = {
   free: {
     colabs_create_max: 3,        // how many colabs a free user can create (owner)
-    colabs_contribute_max: 10,   // how many colabs a free user can be a member/contributor in
-    challenges_create: 'Yes — 1 active challenge at a time',
+   
   },
   pro: {
     colabs_create_max: Infinity, // unlimited
-    colabs_contribute_max: Infinity,
-    challenges_create: 'Yes — unlimited active challenges',
+   
   }
 }
 
@@ -212,8 +210,7 @@ export default function PricingPage() {
               `${PLAN_LIMITS.free.lit_searches} literature searches / mo`,
               `${PLAN_LIMITS.free.analyses} analyses / mo`,
               `${niceCount(PLAN_RULES.free.colabs_create_max)} colabs you can create`,
-              `${niceCount(PLAN_RULES.free.colabs_contribute_max)} colabs you can contribute in`,
-              `Create Challenges: ${PLAN_RULES.free.challenges_create}`,
+              
               'Public & private colabs (owner controls visibility)',
               'Community support',
             ]}
@@ -236,8 +233,7 @@ export default function PricingPage() {
               `${PLAN_LIMITS.pro.lit_searches} literature searches / mo`,
               `${PLAN_LIMITS.pro.analyses} analyses / mo`,
               `${niceCount(PLAN_RULES.pro.colabs_create_max)} colabs you can create`,
-              `${niceCount(PLAN_RULES.pro.colabs_contribute_max)} colabs you can contribute in`,
-              `Create Challenges: ${PLAN_RULES.pro.challenges_create}`,
+             
               'Priority models & faster lanes',
               'Email support',
             ]}
@@ -274,14 +270,14 @@ export default function PricingPage() {
               <h3 className="font-semibold mb-2">Free</h3>
               <ul className="space-y-1 text-slate-700">
                 <li>• Create up to <strong>{PLAN_RULES.free.colabs_create_max}</strong> colabs</li>
-                <li>• Contribute in up to <strong>{PLAN_RULES.free.colabs_contribute_max}</strong> colabs</li>
+                
               </ul>
             </div>
             <div className="p-4 rounded-lg border bg-indigo-50 border-indigo-200">
               <h3 className="font-semibold mb-2">Pro</h3>
               <ul className="space-y-1 text-slate-800">
                 <li>• Create: <strong>{niceCount(PLAN_RULES.pro.colabs_create_max)}</strong></li>
-                <li>• Contribute in: <strong>{niceCount(PLAN_RULES.pro.colabs_contribute_max)}</strong></li>
+                
               </ul>
             </div>
           </div>

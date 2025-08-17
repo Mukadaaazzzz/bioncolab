@@ -45,8 +45,6 @@ export default function LargeTestimonial() {
               <Feature>10 analyses / month</Feature>
               <Divider />
               <Feature>Create up to 3 colabs</Feature>
-              <Feature>Contribute in up to 10 colabs</Feature>
-              <Feature>1 active challenge at a time</Feature>
               <Divider />
               <Feature>Public or private colabs (owner controls)</Feature>
               <Feature>Basic AI co-pilot access</Feature>
@@ -79,8 +77,6 @@ export default function LargeTestimonial() {
               <Feature>200 analyses / month</Feature>
               <Divider />
               <Feature>Unlimited colabs you can create</Feature>
-              <Feature>Unlimited colabs you can contribute in</Feature>
-              <Feature>Unlimited active challenges</Feature>
               <Divider />
               <Feature>Priority AI models & faster lanes</Feature>
               <Feature>Email support</Feature>
